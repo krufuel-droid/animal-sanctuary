@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { fnv1a } from './rng';
 import { migrateSave, type MigrationDeps } from './migrate';
+import { audioPrefsOf, DEFAULT_AUDIO_PREFS } from './schema';
 import {
   SAVE_KEY,
   clearSave,
@@ -228,5 +229,28 @@ describe('A4 — a frozen mid-choice adoption survives the move', () => {
   it('rejects garbage imports without throwing', () => {
     expect(parseImport('}{').status).toBe('invalid');
     expect(parseImport('{"coins":"lots"}').status).toBe('invalid');
+  });
+});
+
+describe('audio settings (§8.3 — additive, defaults merged)', () => {
+  it('a save carrying settings.audio keeps it through migration; prefs merge over defaults', () => {
+    const raw = structuredClone(V1_SAVE) as Record<string, unknown>;
+    raw.settings = { audio: { muted: true, volume: 0.5 } };
+    const result = migrateSave(raw, makeDeps());
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    expect(audioPrefsOf(result.state)).toEqual({
+      v: 1, muted: true, volume: 0.5, ambience: true, music: true, calm: false,
+    });
+    const store = new FakeStorage();
+    saveSave(store, result.state);
+    const back = loadSave(store);
+    expect(back.status).toBe('ok');
+    if (back.status === 'ok') expect(audioPrefsOf(back.state).muted).toBe(true);
+  });
+
+  it('a save without settings yields the defaults (volume 0.9, unmuted)', () => {
+    expect(audioPrefsOf(null)).toEqual(DEFAULT_AUDIO_PREFS);
+    expect(audioPrefsOf(migratedV1())).toEqual(DEFAULT_AUDIO_PREFS);
   });
 });

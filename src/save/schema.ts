@@ -116,8 +116,53 @@ export const pendingAdoptionSchema = z.object({
 });
 export type PendingAdoption = z.infer<typeof pendingAdoptionSchema>;
 
+// Sound prefs (SOUND-DESIGN-DEEP-DIVE §8.3) — additive + optional; every field
+// optional in the schema, defaults merged at load (audioPrefsOf). Fresh Start
+// never resets these: they are parent/device settings, not sanctuary state.
+export const audioSettingsSchema = z.object({
+  v: z.number().int().optional(),
+  muted: z.boolean().optional(),
+  volume: z.number().min(0).max(1).optional(),
+  ambience: z.boolean().optional(),
+  music: z.boolean().optional(),
+  calm: z.boolean().optional(),
+});
+export type AudioSettings = z.infer<typeof audioSettingsSchema>;
+
+export interface AudioPrefs {
+  v: 1;
+  muted: boolean;
+  volume: number;
+  ambience: boolean;
+  music: boolean;
+  calm: boolean;
+}
+
+export const DEFAULT_AUDIO_PREFS: AudioPrefs = {
+  v: 1,
+  muted: false,
+  volume: 0.9,
+  ambience: true,
+  music: true,
+  calm: false,
+};
+
+export function audioPrefsOf(state: { settings?: { audio?: AudioSettings } | undefined } | null | undefined): AudioPrefs {
+  const a = state?.settings?.audio;
+  if (!a) return { ...DEFAULT_AUDIO_PREFS };
+  return {
+    v: 1,
+    muted: a.muted ?? DEFAULT_AUDIO_PREFS.muted,
+    volume: typeof a.volume === 'number' ? Math.min(1, Math.max(0, a.volume)) : DEFAULT_AUDIO_PREFS.volume,
+    ambience: a.ambience ?? DEFAULT_AUDIO_PREFS.ambience,
+    music: a.music ?? DEFAULT_AUDIO_PREFS.music,
+    calm: a.calm ?? DEFAULT_AUDIO_PREFS.calm,
+  };
+}
+
 export const gameStateSchema = z.object({
   version: z.number().int(),
+  settings: z.object({ audio: audioSettingsSchema.optional() }).optional(),
   // v1 root:
   coins: z.number().int().min(0),
   ownedItems: z.array(z.string()),

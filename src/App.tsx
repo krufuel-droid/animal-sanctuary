@@ -13,7 +13,10 @@ import { CARE_ACTION_LIST, GENERIC_LINES, type CareActionId } from './game/care'
 import { TRAITS, rollTrait } from './game/traits';
 import { ROSTER_ORDER, SPECIES } from './game/roster';
 import { OUTFITS, AnimalSvg, type OutfitId } from './game/animals';
-import { ADOPTERS_BY_ID } from './game/adopters';
+import { ADOPTERS_BY_ID, homeRootOf } from './game/adopters';
+import { Snd } from './audio/sound';
+import SoundLab from './audio/Lab';
+import { audioPrefsOf, DEFAULT_AUDIO_PREFS, type AudioPrefs } from './save/schema';
 import {
   applyAdoptionCooldowns,
   generateOffer,
@@ -96,6 +99,9 @@ export default function App() {
   const [confirmReset, setConfirmReset] = useState(false);
   const [importText, setImportText] = useState('');
   const [importMsg, setImportMsg] = useState<string | null>(null);
+  const [audioPrefs, setAudioPrefs] = useState<AudioPrefs>({ ...DEFAULT_AUDIO_PREFS });
+  const [soundPop, setSoundPop] = useState(false);
+  const prevPhase = useRef<string | null>(null);
   const stageRef = useRef<StageHandle | null>(null);
   const visitStageRef = useRef<StageHandle | null>(null);
   const celebrationRef = useRef<HTMLDivElement | null>(null);
@@ -110,6 +116,9 @@ export default function App() {
     const result = loadSave(STORAGE);
     if (result.status === 'ok') {
       setGame(result.state);
+      const prefs = audioPrefsOf(result.state);
+      setAudioPrefs(prefs);
+      Snd.loadPrefs(prefs, result.state.rngSeed);
       if (result.migratedFrom < CURRENT_SAVE_VERSION) {
         try {
           saveSave(STORAGE, result.state);
@@ -171,6 +180,35 @@ export default function App() {
     };
   }, []);
 
+  /* ---------- sound: unlock on every pointerdown (capture); the engine
+     latches, sets the iOS audio session on the first tap, and stays silent
+     until then by design (SOUND-DESIGN-DEEP-DIVE §3.3). */
+  useEffect(() => {
+    const unlock = () => Snd.unlock();
+    document.addEventListener('pointerdown', unlock, true);
+    return () => document.removeEventListener('pointerdown', unlock, true);
+  }, []);
+
+  /* prefs changes (mute / volume) persist into the save's settings.audio */
+  useEffect(() => {
+    Snd.setOnPrefs((p) => {
+      setAudioPrefs(p);
+      const g = gameRef.current;
+      if (g) commit({ ...g, settings: { audio: p } });
+    });
+  }, [commit]);
+
+  /* the celebration sound fires on the caring → celebration FLIP only —
+     never on a reload that lands mid-celebration */
+  useEffect(() => {
+    const phase = game?.phase ?? null;
+    if (prevPhase.current === 'caring' && phase === 'celebration' && game?.current) {
+      Snd.play('celebrate.adoption', { species: game.current.species, delay: 0.35 });
+      Snd.duck('amb', -8);
+    }
+    if (phase !== null) prevPhase.current = phase;
+  }, [game?.phase, game?.current]);
+
   /* bring the celebration into view when the phase flips (audit F3/C3) */
   useEffect(() => {
     if (game?.phase === 'celebration') {
@@ -230,6 +268,18 @@ export default function App() {
     }
     stage?.say(line);
     stage?.floatEmojis(bonus ? ['❤️', '✨', '🪙'] : ['❤️', '🪙']);
+
+    // Sound: the care action, the heart ladder for each heart just filled
+    // (the bonus heart gets the octave shimmer), and the throttled coin tick.
+    Snd.play(`care.${action}`, { species: current.species, favourite: isFav });
+    for (let k = 0; k < heartsGain; k++) {
+      Snd.play('heart.fill', {
+        noteIndex: current.hearts + k,
+        favourite: bonus && k === heartsGain - 1,
+        delay: 0.12 + k * 0.1,
+      });
+    }
+    Snd.play('coin.earn');
 
     const next: GameState = {
       ...game,
@@ -306,6 +356,8 @@ export default function App() {
       matchScore: chosenScore,
       storySummary: story.summary,
     };
+    Snd.play('coin.cascade', { delay: 0.05 });
+    if (badge) Snd.play('celebrate.perfect', { delay: 0.2 });
     commit({
       ...game,
       coins: game.coins + 30,
@@ -329,6 +381,7 @@ export default function App() {
       (current?.traitId as TraitId | null) ?? null,
     );
     favLineIdx.current = 0;
+    Snd.play('arrive', { species: rescue.species, delay: 0.05 });
     commit({
       ...game,
       rotationIndex: nextIdx,
@@ -340,11 +393,20 @@ export default function App() {
 
   /* ------------------------------ shop ------------------------------ */
   const handleBuy = (outfitId: OutfitId, price: number) => {
-    if (!game || game.ownedItems.includes(outfitId) || game.coins < price) return;
+    if (!game || game.ownedItems.includes(outfitId)) return;
+    if (game.coins < price) {
+      // no error sound exists in this game — a warm "not yet" shrug (§2.4)
+      Snd.play('shop.notyet');
+      return;
+    }
+    Snd.play('shop.buy');
     commit({ ...game, coins: game.coins - price, ownedItems: [...game.ownedItems, outfitId] });
   };
   const handleWear = (outfitId: OutfitId) => {
     if (!game || !current) return;
+    const equipping = current.outfit !== outfitId;
+    if (equipping) Snd.play('shop.equip', { species: current.species });
+    else Snd.play('ui.tap');
     commit({
       ...game,
       current: { ...current, outfit: current.outfit === outfitId ? null : outfitId },
@@ -366,11 +428,19 @@ export default function App() {
     }
     stage?.say(line);
     stage?.floatEmojis(['💗']);
+    // visits are a quieter room than the yard: same care sounds at −2 dB (§1.2 row 27)
+    Snd.play(`care.${action}`, {
+      species: entry.species,
+      favourite: !!trait && trait.loves === action,
+      gain: 0.79,
+    });
   };
 
   /* ------------------------------ reset / import ------------------------------ */
   const handleFreshStart = () => {
-    const fresh = freshState();
+    // Fresh Start does NOT reset audio prefs (§8.3) — they ride along.
+    Snd.play('ui.close'); // a door closing gently — no dramatic sting (§1.3)
+    const fresh: GameState = { ...freshState(), settings: { audio: Snd.getPrefs() } };
     setView({ kind: 'sanctuary' });
     setConfirmReset(false);
     setLoadIssue(null);
@@ -388,6 +458,9 @@ export default function App() {
       setLoadIssue(null);
       setImportMsg(null);
       setView({ kind: 'sanctuary' });
+      const prefs = audioPrefsOf(result.state);
+      setAudioPrefs(prefs);
+      Snd.loadPrefs(prefs, result.state.rngSeed);
       commit(result.state);
       try {
         saveSave(STORAGE, result.state);
@@ -402,6 +475,10 @@ export default function App() {
   };
 
   /* ------------------------------ render ------------------------------ */
+  if (typeof window !== 'undefined' && window.location.hash === '#lab') {
+    return <SoundLab />;
+  }
+
   if (loadIssue) {
     return (
       <Shell>
@@ -456,11 +533,52 @@ export default function App() {
 
   return (
     <Shell>
-      <header className="flex items-center justify-between mb-3">
+      <header className="relative flex items-center justify-between mb-3">
         <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">🐾 Animal Sanctuary</h1>
-        <div className="rounded-full bg-white/90 border border-amber-200 px-4 py-1.5 font-bold shadow-sm" aria-label={`${game.coins} coins`}>
-          🪙 {game.coins}
+        <div className="flex items-center gap-2">
+          {/* Sound controls — top bar, first viewport, one tap to silence
+              (SOUND-DESIGN-DEEP-DIVE §5.5.2). Stored mute is sacred. */}
+          <div className="flex items-center rounded-full bg-white/90 border border-amber-200 shadow-sm">
+            <button
+              type="button"
+              onClick={() => Snd.setMuted(!audioPrefs.muted)}
+              aria-label={audioPrefs.muted ? 'Sound is off — tap to turn sound on' : 'Sound is on — tap to mute'}
+              className="w-11 h-11 rounded-full text-xl leading-none"
+            >
+              {audioPrefs.muted ? '🔇' : '🔊'}
+            </button>
+            <button
+              type="button"
+              onClick={() => setSoundPop((v) => !v)}
+              aria-label="Volume"
+              aria-expanded={soundPop}
+              className="w-7 h-11 rounded-full text-xs text-stone-500"
+            >
+              ▾
+            </button>
+          </div>
+          <div className="rounded-full bg-white/90 border border-amber-200 px-4 py-1.5 font-bold shadow-sm" aria-label={`${game.coins} coins`}>
+            🪙 {game.coins}
+          </div>
         </div>
+        {soundPop && (
+          <div className="absolute right-0 top-12 z-20 rounded-2xl bg-white border border-amber-200 shadow-lg px-4 py-3 w-60">
+            <label className="flex items-center gap-2 text-sm font-semibold text-stone-700">
+              Volume
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={Math.round(audioPrefs.volume * 100)}
+                onChange={(e) => Snd.setVolume(Number(e.target.value) / 100)}
+                className="flex-1 accent-amber-500"
+                aria-label="Volume"
+              />
+              <span className="w-9 text-right">{Math.round(audioPrefs.volume * 100)}%</span>
+            </label>
+            <p className="text-xs text-stone-400 mt-1.5">Sound settings are remembered on this device.</p>
+          </div>
+        )}
       </header>
 
       {view.kind === 'sanctuary' && (
@@ -564,7 +682,10 @@ export default function App() {
                   <div className="flex flex-wrap justify-center gap-3 mt-4">
                     <button
                       type="button"
-                      onClick={() => setView({ kind: 'visit', entryId: lastAdopted.id })}
+                      onClick={() => {
+                        Snd.play('visit.greet', { species: lastAdopted.species, homeRoot: homeRootOf(lastAdopted.adopterId) });
+                        setView({ kind: 'visit', entryId: lastAdopted.id });
+                      }}
                       className="rounded-full bg-amber-400 hover:bg-amber-300 font-bold px-5 py-2.5 shadow"
                     >
                       Visit {lastAdopted.name} 💛
@@ -605,8 +726,8 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => handleBuy(o.id, o.price)}
-                        disabled={game.coins < o.price}
-                        className="mt-2 rounded-full bg-amber-400 hover:bg-amber-300 disabled:opacity-40 px-3.5 py-1.5 text-sm font-bold"
+                        aria-disabled={game.coins < o.price}
+                        className={`mt-2 rounded-full bg-amber-400 hover:bg-amber-300 px-3.5 py-1.5 text-sm font-bold ${game.coins < o.price ? 'opacity-50' : ''}`}
                       >
                         🪙 {o.price}
                       </button>
@@ -619,7 +740,10 @@ export default function App() {
 
           <button
             type="button"
-            onClick={() => setView({ kind: 'album' })}
+            onClick={() => {
+              Snd.play('album.open');
+              setView({ kind: 'album' });
+            }}
             className="mt-3 w-full rounded-3xl bg-indigo-100 hover:bg-indigo-200 border border-indigo-200 p-4 font-extrabold text-lg shadow-sm"
           >
             📖 Adoption Album ({game.album.length})
@@ -631,7 +755,7 @@ export default function App() {
         <section className="rounded-3xl bg-white/90 border border-amber-200 p-4 shadow-sm animate-pop-in">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-xl font-extrabold">📖 Adoption Album</h2>
-            <button type="button" onClick={() => setView({ kind: 'sanctuary' })} className="rounded-full bg-amber-200 hover:bg-amber-300 font-bold px-4 py-1.5">
+            <button type="button" onClick={() => { Snd.play('ui.close'); setView({ kind: 'sanctuary' }); }} className="rounded-full bg-amber-200 hover:bg-amber-300 font-bold px-4 py-1.5">
               ← Back
             </button>
           </div>
@@ -656,7 +780,10 @@ export default function App() {
                   </div>
                   <button
                     type="button"
-                    onClick={() => setView({ kind: 'visit', entryId: entry.id })}
+                    onClick={() => {
+                      Snd.play('visit.greet', { species: entry.species, homeRoot: homeRootOf(entry.adopterId) });
+                      setView({ kind: 'visit', entryId: entry.id });
+                    }}
                     className="shrink-0 rounded-full bg-amber-400 hover:bg-amber-300 font-bold px-4 py-2 shadow-sm"
                   >
                     Visit 💛
@@ -673,14 +800,14 @@ export default function App() {
         <VisitView
           entry={visitEntry}
           stageRef={visitStageRef}
-          onBack={() => setView({ kind: 'album' })}
+          onBack={() => { Snd.play('ui.close'); setView({ kind: 'album' }); }}
           onCare={handleVisitCare(visitEntry)}
         />
       )}
       {view.kind === 'visit' && !visitEntry && (
         <section className="rounded-3xl bg-white/90 border border-amber-200 p-6 text-center">
           <p className="mb-4">That friend couldn't be found.</p>
-          <button type="button" onClick={() => setView({ kind: 'album' })} className="rounded-full bg-amber-200 font-bold px-4 py-2">← Album</button>
+          <button type="button" onClick={() => { Snd.play('ui.close'); setView({ kind: 'album' }); }} className="rounded-full bg-amber-200 font-bold px-4 py-2">← Album</button>
         </section>
       )}
 
@@ -689,10 +816,10 @@ export default function App() {
           <span className="inline-flex items-center gap-2 text-sm">
             <span className="font-semibold text-stone-700">Start over? The whole sanctuary will be new.</span>
             <button type="button" onClick={handleFreshStart} className="rounded-full bg-red-100 hover:bg-red-200 text-red-800 font-bold px-3.5 py-1.5">Yes, fresh start</button>
-            <button type="button" onClick={() => setConfirmReset(false)} className="rounded-full bg-stone-100 hover:bg-stone-200 font-bold px-3.5 py-1.5">Keep playing</button>
+            <button type="button" onClick={() => { Snd.play('ui.tap'); setConfirmReset(false); }} className="rounded-full bg-stone-100 hover:bg-stone-200 font-bold px-3.5 py-1.5">Keep playing</button>
           </span>
         ) : (
-          <button type="button" onClick={() => setConfirmReset(true)} className="text-sm text-stone-400 hover:text-stone-600 underline">
+          <button type="button" onClick={() => { Snd.play('ui.tap'); setConfirmReset(true); }} className="text-sm text-stone-400 hover:text-stone-600 underline">
             Fresh Start
           </button>
         )}
@@ -819,7 +946,7 @@ function BackupCorner({
     <div className="mt-5 border-t border-stone-200 pt-4">
       <button
         type="button"
-        onClick={() => setOpen(!open)}
+        onClick={() => { Snd.play('ui.tap'); setOpen(!open); }}
         className="font-bold text-stone-600 hover:text-stone-800"
         aria-expanded={open}
       >

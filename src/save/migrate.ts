@@ -234,6 +234,11 @@ export function migrateSave(
     lastStoryTemplateIds: isRecord(raw.lastStoryTemplateIds)
       ? raw.lastStoryTemplateIds
       : null,
+    // Sound prefs ride through every migration untouched (§8.3): they are
+    // parent/device settings, and the field-by-field rebuild above must
+    // never drop them. The schema validates the shape; audioPrefsOf merges
+    // defaults at read time.
+    ...(isRecord(raw.settings) ? { settings: raw.settings } : {}),
   };
 
   // Final gate: the migrated shape must satisfy the v4 contract. If it does

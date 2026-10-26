@@ -185,3 +185,50 @@ export const ADOPTERS: Adopter[] = [
 export const ADOPTERS_BY_ID: Record<string, Adopter> = Object.fromEntries(
   ADOPTERS.map((a) => [a.id, a]),
 );
+
+/**
+ * Each home's pentatonic root (Hz) — SOUND-DESIGN-DEEP-DIVE §1.2 row 26:
+ * a visit greeting plays one soft pad note in the home's key. Marco's balcony
+ * is G and Luna's library is C, per the dive's examples.
+ */
+export const HOME_ROOTS: Record<string, number> = {
+  maya: 329.63, // E4
+  ellis: 196.0, // G3
+  'park-family': 392.0, // G4
+  sam: 293.66, // D4
+  luna: 261.63, // C4
+  rosa: 220.0, // A3
+  finn: 196.0, // G3
+  aisha: 293.66, // D4
+  marco: 392.0, // G4
+  bea: 440.0, // A4
+  kenji: 329.63, // E4
+  ivy: 261.63, // C4
+};
+
+export function homeRootOf(adopterId: string | null | undefined): number {
+  if (!adopterId) return 261.63; // legacy "cozy" home = C
+  return HOME_ROOTS[adopterId] ?? 261.63;
+}
+
+/** Same roots keyed by homeTheme — album entries store the theme, not the id. */
+export const THEME_ROOTS: Record<string, number> = {
+  garden: 329.63,
+  farm: 196.0,
+  backyard: 392.0,
+  bakery: 293.66,
+  library: 261.63,
+  studio: 220.0,
+  lake: 196.0,
+  'pets-house': 293.66,
+  balcony: 392.0,
+  meadow: 440.0,
+  hilltop: 329.63,
+  park: 261.63,
+  cozy: 261.63,
+};
+
+export function themeRootOf(homeTheme: string | null | undefined): number {
+  if (!homeTheme) return 261.63;
+  return THEME_ROOTS[homeTheme] ?? 261.63;
+}
