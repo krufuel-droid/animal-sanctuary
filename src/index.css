@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+/* Animal Sanctuary theme — Tailwind v4 + the idle-life rig CSS
+   (PHASE0-DEEP-DIVE Feature 1). Loops live here, parameterised by the
+   custom properties the idle hook sets per animal; one-shots are WAAPI. */
+
+:root {
+  --ink: #3d3630;
+}
+
+body {
+  color: var(--ink);
+  font-family: ui-rounded, "Comic Sans MS", "Chalkboard SE", system-ui, sans-serif;
+}
+
+/* ---------- rig: every animated part gets fill-box so origins are local --- */
+.animal-svg .a-body,
+.animal-svg .a-head,
+.animal-svg .a-eyes,
+.animal-svg .a-ear-l,
+.animal-svg .a-ear-r,
+.animal-svg .a-nose,
+.animal-svg .a-tail,
+.animal-svg .a-pose,
+.animal-svg .a-sway,
+.animal-svg .a-sig,
+.animal-svg .a-sig-l,
+.animal-svg .a-sig-r {
+  transform-box: fill-box;
+}
+.animal-svg .a-body { transform-origin: 50% 100%; }
+.animal-svg .a-head { transform-origin: 50% 88%; }
+.animal-svg .a-eyes { transform-origin: 50% 50%; }
+.animal-svg .a-ear-l { transform-origin: 50% 88%; }
+.animal-svg .a-ear-r { transform-origin: 50% 88%; }
+.animal-svg .a-nose { transform-origin: 50% 50%; }
+.animal-svg .a-pose { transform-origin: 50% 92%; transition: transform 1s ease-in-out; }
+.animal-svg .a-sway { transform-origin: 50% 100%; }
+.animal-svg .a-tail { transform-origin: 88% 85%; }
+.animal-svg[data-species="cat"] .a-tail,
+.animal-svg[data-species="fox"] .a-tail { transform-origin: 12% 92%; }
+.animal-svg .a-sig { transform-origin: 50% 30%; }
+.animal-svg[data-species="duck"] .a-sig { transform-origin: 85% 20%; }
+.animal-svg .a-sig-l { transform-origin: 88% 12%; }
+.animal-svg .a-sig-r { transform-origin: 12% 12%; }
+
+/* ---------- continuous loops (idle-on only) ---------- */
+@keyframes kf-breath {
+  0%, 100% { transform: scale(1, 1); }
+  50% { transform: scale(var(--breath-sx, 1.018), var(--breath-sy, 1.03)); }
+}
+@keyframes kf-sway {
+  0%, 100% { transform: rotate(calc(var(--sway-rot, 1.1deg) * -1)); }
+  50% { transform: rotate(var(--sway-rot, 1.1deg)); }
+}
+@keyframes kf-wag {
+  0%, 100% { transform: rotate(-9deg); }
+  50% { transform: rotate(11deg); }
+}
+@keyframes kf-tailsway {
+  0%, 100% { transform: rotate(-4deg); }
+  50% { transform: rotate(5deg); }
+}
+@keyframes kf-bob-duck {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  30% { transform: translateY(2.6px) rotate(1.6deg); }
+  55% { transform: translateY(-1px) rotate(-1deg); }
+}
+@keyframes kf-nod {
+  0%, 100% { transform: rotate(0deg) translateY(0); }
+  35% { transform: rotate(5deg) translateY(2.4px); }
+  48% { transform: rotate(1deg) translateY(0.6px); }
+  75% { transform: rotate(6.4deg) translateY(3px); }
+}
+@keyframes kf-zzz {
+  0% { opacity: 0; transform: translateY(4px) scale(0.8); }
+  25% { opacity: 0.9; }
+  100% { opacity: 0; transform: translateY(-13px) scale(1.12); }
+}
+
+.idle-on .a-body { animation: kf-breath var(--breath-dur, 3s) ease-in-out infinite; }
+.idle-on .a-sway { animation: kf-sway var(--sway-dur, 6s) ease-in-out infinite; }
+.idle-on[data-species="dog"] .a-tail,
+.idle-on[data-species="duck"] .a-tail { animation: kf-wag var(--tail-dur, 1s) ease-in-out infinite; }
+.idle-on[data-species="cat"] .a-tail,
+.idle-on[data-species="fox"] .a-tail { animation: kf-tailsway var(--tail-dur, 3.4s) ease-in-out infinite; }
+.idle-on[data-species="turtle"] .a-tail { animation: kf-tailsway 6s ease-in-out infinite; }
+.idle-on[data-species="duck"] .a-head { animation: kf-bob-duck 1.65s ease-in-out infinite; }
+.animal-svg[data-species="turtle"] { --breath-sx: 1.007; --breath-sy: 1.011; }
+.animal-svg[data-species="panda"] { --breath-sx: 1.026; --breath-sy: 1.044; }
+.animal-svg[data-species="penguin"] { --sway-rot: 4.2deg; }
+.animal-svg[data-species="duck"] { --sway-rot: 1.4deg; }
+
+/* ---------- sleep states (motion replaced, not removed) ---------- */
+.animal-svg .a-eyes-closed { opacity: 0; transition: opacity 0.35s; }
+.animal-svg .a-eyes-open { transition: opacity 0.35s; }
+.animal-svg.sleep-asleep .a-eyes-open { opacity: 0; }
+.animal-svg.sleep-asleep .a-eyes-closed { opacity: 1; }
+.animal-svg.sleep-sleepy .a-head { animation: kf-nod 3.6s ease-in-out infinite; }
+.idle-on.sleep-asleep .a-sway { animation: none; }
+.animal-svg.sleep-asleep .a-pose { transform: translateY(5px) scale(1.02, 0.95); }
+.animal-svg.sleep-asleep .a-head { transform: rotate(var(--sleep-head-rot, 6deg)) translateY(3px); transition: transform 1s ease-in-out; }
+.animal-svg[data-species="cat"].sleep-asleep .a-pose { transform: translateY(6px) scale(1.05, 0.9); }
+.animal-svg[data-species="bunny"].sleep-asleep .a-pose { transform: translateY(6px) scale(1.06, 0.89); }
+.animal-svg[data-species="panda"].sleep-asleep .a-pose { transform: translateY(6px) scale(1.03, 0.93); }
+.animal-svg[data-species="duck"].sleep-asleep .a-head { transform: rotate(17deg) translate(-3px, 5px); }
+.animal-svg[data-species="turtle"].sleep-asleep .a-head { transform: scale(0.42) translateX(-7px); }
+.animal-svg[data-species="hedgehog"].sleep-asleep .a-head { transform: scale(0.5) translateY(9px); }
+.animal-svg[data-species="fox"] { --sleep-head-rot: 7deg; }
+.animal-svg[data-species="penguin"] { --sleep-head-rot: 9deg; }
+.animal-svg[data-species="cat"] { --sleep-head-rot: 8deg; }
+
+.animal-svg .a-zzz text {
+  font-size: 15px;
+  font-weight: 700;
+  fill: #7a9cc6;
+  animation: kf-zzz 3.2s ease-out infinite;
+}
+.animal-svg .a-zzz .z2 { animation-delay: 1.05s; font-size: 18px; }
+.animal-svg .a-zzz .z3 { animation-delay: 2.1s; font-size: 21px; }
+
+/* ---------- app-level motion (from the original theme) ---------- */
+@keyframes float-up {
+  0% { opacity: 0; transform: translateY(6px) scale(0.7); }
+  18% { opacity: 1; transform: translateY(0) scale(1.1); }
+  100% { opacity: 0; transform: translateY(-58px) scale(1); }
+}
+@keyframes animal-bounce {
+  0% { transform: translateY(0) scale(1, 1); }
+  35% { transform: translateY(-13px) scale(0.97, 1.04); }
+  65% { transform: translateY(1px) scale(1.03, 0.96); }
+  100% { transform: translateY(0) scale(1, 1); }
+}
+@keyframes pop-in {
+  0% { opacity: 0; transform: scale(0.92) translateY(8px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes twinkle {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.8); }
+}
+.animate-float-up { animation: float-up 1.05s ease-out forwards; }
+.animate-animal-bounce { animation: animal-bounce 0.55s ease-out; }
+.animate-pop-in { animation: pop-in 0.35s ease-out; }
+.animate-twinkle { animation: twinkle 1.15s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .animal-svg .a-body,
+  .animal-svg .a-sway,
+  .animal-svg .a-tail,
+  .animal-svg .a-head,
+  .animal-svg .a-zzz text,
+  .animate-float-up,
+  .animate-animal-bounce,
+  .animate-twinkle {
+    animation: none !important;
+  }
+  .animate-pop-in { animation-duration: 0.01s; }
+}
