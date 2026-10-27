@@ -34,7 +34,7 @@ export default defineConfig({
         ],
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,svg,png,ico,webmanifest}'],
+        globPatterns: ['**/*.{js,css,html,svg,png,ico,webmanifest,mp3}'],
         navigateFallback: '/animal-sanctuary/index.html',
         cleanupOutdatedCaches: true,
       },

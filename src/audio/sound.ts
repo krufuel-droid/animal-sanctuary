@@ -1,7 +1,9 @@
 // Animal Sanctuary sound engine + synthesized recipes.
 // Spec of record: ~/workspace/animal-sanctuary-research/SOUND-DESIGN-DEEP-DIVE.md
-// Stage SND-1: engine, buses, unlock, core care/UI/celebration set. All synth,
-// 0 KB of audio files. No speech synthesis anywhere, ever (household rule).
+// Stage SND-1: engine, buses, unlock, core care/UI/celebration set. All synth
+// except ONE admitted recorded file: vocal-purr.mp3 (§6.3 — the synth purr
+// failed Amanda's ear-check, "motor noises," 2026-10-26; see public/audio/
+// CREDITS.md). No speech synthesis anywhere, ever (household rule).
 //
 // Gain table (§5.2 — load-bearing once Amanda's ear-check approves Stage 1):
 //   UI 0.50 · Animal 0.80 · Ambient 0.35 · Celebration 0.70 · master = prefs.volume
@@ -53,6 +55,60 @@ function noiseBuffer(ctx: BaseAudioContext): AudioBuffer {
     noiseBuffers.set(ctx, b);
   }
   return b;
+}
+
+// ---------------------------------------------------------------------------
+// Recorded purr (§6.3 admitted file #1 — public/audio/vocal-purr.mp3, public
+// domain, logged in public/audio/CREDITS.md). Fetched + decoded ONCE, kicked
+// off when this module loads (decode via a throwaway OfflineAudioContext —
+// no user gesture needed), so the real cat is already in memory before the
+// first tap of the session; decoding early also removes the first-Pet race
+// where the unlock tap's own Pet would otherwise beat the download and fall
+// back to the synth motor. A decoded AudioBuffer is context-independent, so
+// the one buffer serves every context. Until it lands (offline renders, any
+// fetch failure) the synth recipe below remains the fallback.
+const purrState: { buf: AudioBuffer | null; started: boolean } = { buf: null, started: false };
+function ensurePurr(): void {
+  if (purrState.started) return;
+  purrState.started = true;
+  void (async () => {
+    try {
+      const res = await fetch(`${import.meta.env.BASE_URL}audio/vocal-purr.mp3`);
+      if (!res.ok) return;
+      const raw = await res.arrayBuffer();
+      const decoder = new OfflineAudioContext(1, 1, 44100);
+      purrState.buf = await decoder.decodeAudioData(raw);
+    } catch {
+      /* no file, no problem — synth fallback covers it */
+    }
+  })();
+}
+ensurePurr();
+
+/** Play the recorded purr: random offset into the seamless loop each time
+ * (variation by position), breath-shaped envelope. Hedgehog churr = the
+ * same cat slowed to ×0.75, shorter and quieter (the §6.2.9 variant ratios). */
+function recordedPurr(rc: RecipeCtx, out: AudioNode, buf: AudioBuffer, gainScale: number, tOff: number, durScale: number, hedgehog: boolean): void {
+  const t = rc.t + tOff;
+  const dur = (1.8 + rc.rng() * 0.8) * durScale;
+  const src = rc.ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  src.playbackRate.value = (hedgehog ? 0.75 : 1) * (1 + (rc.rng() * 2 - 1) * 0.02);
+  const f = rc.ctx.createBiquadFilter();
+  f.type = 'lowpass';
+  f.frequency.value = 900; // warmth + smooths the loop seam
+  const g = rc.ctx.createGain();
+  const peak = 0.45 * gainScale * (hedgehog ? 0.7 : 1);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(peak, t + 0.3);
+  g.gain.setValueAtTime(peak, t + Math.max(0.31, dur - 0.35));
+  g.gain.linearRampToValueAtTime(0.0001, t + dur);
+  src.connect(f);
+  f.connect(g);
+  g.connect(out);
+  src.start(t, rc.rng() * buf.duration);
+  src.stop(t + dur + 0.05);
 }
 
 function noiseSrc(rc: RecipeCtx): AudioBufferSourceNode {
@@ -319,11 +375,19 @@ function vocal(rc: RecipeCtx, out: AudioNode, species: string, kind: VocalKind, 
   }
 }
 
-/** vocal.purr (§6.2.9) — AM flutter percept, NOT a 25 Hz fundamental (iPad
- * speakers can't reproduce it). lfoHz 25 / lp 300 for cat; hedgehog churr
- * variant 18 Hz / 240 / ×0.7 duration. If Amanda's ear-check hears "tiny
- * motor," the recorded-purr fallback (§6.3) is pre-authorized by the spec. */
+/** vocal.purr (§6.2.9) — SYNTH FALLBACK ONLY since 2026-10-27. AM flutter
+ * percept, NOT a 25 Hz fundamental (iPad speakers can't reproduce it).
+ * lfoHz 25 / lp 300 for cat; hedgehog churr variant 18 Hz / 240 / ×0.7
+ * duration. Amanda's ear-check DID hear "tiny motor" (2026-10-26), so the
+ * recorded-purr fallback (§6.3) now plays first — see ensurePurr above. */
 function purr(rc: RecipeCtx, out: AudioNode, gainScale = 1, tOff = 0, lfoHz = 25, lpHz = 300, durScale = 1): void {
+  // §6.3 fallback, admitted 2026-10-27: Amanda's ear-check heard the synth
+  // below as a tiny motor, so a live context plays the REAL recorded purr
+  // (public domain, CREDITS.md) whenever it has loaded. The synth remains
+  // only as the pre-load / offline-render fallback. lfoHz < 20 marks the
+  // hedgehog churr variant (18 Hz in the synth's terms).
+  if (purrState.buf) return recordedPurr(rc, out, purrState.buf, gainScale, tOff, durScale, lfoHz < 20);
+  ensurePurr();
   const t = rc.t + tOff;
   const dur = (1.6 + rc.rng() * 1.0) * durScale; // 1.6–2.6 s
   const f = rc.ctx.createBiquadFilter();
@@ -727,6 +791,9 @@ class Engine {
       node.connect(this.master!);
       this.buses.set(name, node);
     });
+    // The recorded purr (§6.3) starts loading at module load; this is just
+    // a belt-and-braces re-kick in case that attempt was interrupted.
+    ensurePurr();
   }
 
   /** Call from EVERY pointerdown (capture phase). Latches internally. Sets the
