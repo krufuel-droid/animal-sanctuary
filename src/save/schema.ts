@@ -1,10 +1,15 @@
 import { z } from 'zod';
 
-// The v4 save contract for the Animal Sanctuary repo build.
+// The save contract for the Animal Sanctuary repo build.
 // Shape provenance: CODE-AUDIT.md (F1/F2/C4/C6 — the real artifact schema) and
-// PHASE0-DEEP-DIVE.md §B5/§B6 (the fields each Phase 0 stage added).
-// v5 = v4 byte-for-byte (PHASE1-DEEP-DIVE §3 ruling): this schema IS the
-// artifact's v4 shape, so the cutover transfer is a plain import.
+// PHASE0-DEEP-DIVE.md §B5/§B6 (the fields each Phase 0 stage added). The
+// Phase 1 cutover shipped this shape as v4; Phase 2 step 1 bumps to v5.
+//
+// v5 = v4 + additive-optional autonomy state (UTILITY-AI-DEEP-DIVE §7.3):
+// per-rescue `needs` + `aiProfile` + `aiProfileSource`, and root
+// `lastSeenAt`. Every v5 addition is .optional() — a v4 save parses, and
+// migration generates the new fields via the AI stream. Album entries are
+// untouched: forever-home animals get NO needs and NO aiProfile (§7.3).
 //
 // Fencing rules carried over from the audit, binding forever:
 //  - additive-only: never rename, never re-type, never make a field required
@@ -12,7 +17,7 @@ import { z } from 'zod';
 //  - unknown keys are stripped on parse (zod default), never preserved;
 //  - a save that fails validation is NEVER overwritten by the loader.
 
-export const CURRENT_SAVE_VERSION = 4;
+export const CURRENT_SAVE_VERSION = 5;
 
 export const SPECIES_IDS = [
   'dog',
@@ -65,6 +70,32 @@ export const traitSourceSchema = z.enum([
 ]);
 export type TraitSource = z.infer<typeof traitSourceSchema>;
 
+// Phase 2 step 1 additions (§7.3): the resident's five needs (0–100
+// satisfaction floats) and its resolved autonomy profile. The profile is
+// drawn once from the SEPARATE AI stream and stored — never re-derived, so
+// a future weight-table edit cannot retroactively change a living animal.
+export const needsSchema = z.object({
+  tummy: z.number().min(0).max(100),
+  energy: z.number().min(0).max(100),
+  clean: z.number().min(0).max(100),
+  fun: z.number().min(0).max(100),
+  affection: z.number().min(0).max(100),
+});
+export type SavedNeeds = z.infer<typeof needsSchema>;
+
+export const aiProfileSchema = z.object({
+  weights: z.object({
+    tummy: z.number(),
+    energy: z.number(),
+    clean: z.number(),
+    fun: z.number(),
+    affection: z.number(),
+  }),
+  metabolism: z.number(),
+  aiSeed: z.number().int().min(0).max(4294967295),
+});
+export type SavedAiProfile = z.infer<typeof aiProfileSchema>;
+
 export const rescueSchema = z.object({
   species: z.string(),
   name: z.string(),
@@ -77,6 +108,10 @@ export const rescueSchema = z.object({
   traitSource: traitSourceSchema,
   favBonusCount: z.number().int().min(0).max(2),
   favBonusLastDate: z.string().nullable(),
+  // Phase 2 step 1 additions (optional/defaulted per the fencing rules):
+  needs: needsSchema.optional(),
+  aiProfile: aiProfileSchema.optional(),
+  aiProfileSource: z.enum(['rolled', 'migration']).optional(),
 });
 export type Rescue = z.infer<typeof rescueSchema>;
 
@@ -185,5 +220,9 @@ export const gameStateSchema = z.object({
       closing: z.string(),
     })
     .nullable(),
+  // Phase 2 step 1: wall-clock of the last commit, for the §1.3 absence
+  // catch-up on load. Optional + nullable: pre-v5 saves have never been
+  // "seen" by the autonomy engine, so no catch-up applies to them.
+  lastSeenAt: z.number().nullable().optional(),
 });
 export type GameState = z.infer<typeof gameStateSchema>;

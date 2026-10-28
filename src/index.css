@@ -144,6 +144,15 @@ body {
 .animate-pop-in { animation: pop-in 0.35s ease-out; }
 .animate-twinkle { animation: twinkle 1.15s ease-in-out infinite; }
 
+/* ---------- Phase 2 yard: the resident walks between advertisers.
+   The walker is an HTML wrapper around the stage (never an SVG group, so
+   it cannot clobber the rig's transforms); short linear transitions
+   smooth the sim's 10 Hz position updates into a stroll. */
+.yard-walker {
+  transition: left 0.13s linear, top 0.13s linear;
+  will-change: left, top;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animal-svg .a-body,
   .animal-svg .a-sway,
@@ -156,4 +165,7 @@ body {
     animation: none !important;
   }
   .animate-pop-in { animation-duration: 0.01s; }
+  /* Motion replaced, not removed: the walker still relocates (the sim's
+     state is information), just without the glide. */
+  .yard-walker { transition: none; }
 }

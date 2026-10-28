@@ -12,7 +12,12 @@ import { newMasterSeed } from './save/rng';
 import { CARE_ACTION_LIST, GENERIC_LINES, type CareActionId } from './game/care';
 import { TRAITS, rollTrait } from './game/traits';
 import { ROSTER_ORDER, SPECIES } from './game/roster';
-import { OUTFITS, AnimalSvg, type OutfitId } from './game/animals';
+import { OUTFITS, AnimalSvg, type OutfitId, type SleepState } from './game/animals';
+import { YardProp } from './game/props';
+import { YardSim, type SimSnapshot } from './sim/yardSim';
+import { deriveAiProfile } from './sim/traits-ai';
+import { absenceCatchUp, NEED_ICONS, type Needs } from './sim/needs';
+import { YARD_LAYOUT } from './sim/advertisers';
 import { ADOPTERS_BY_ID, homeRootOf } from './game/adopters';
 import { Snd } from './audio/sound';
 import SoundLab from './audio/Lab';
@@ -57,6 +62,9 @@ function makeRescue(
 ): Rescue {
   const species = ROSTER_ORDER[speciesIdx];
   const { traitId, traitSeed } = rollTrait(species, rngSeed, arrivalIndex, previousTraitId);
+  // Phase 2: the autonomy profile is rolled from the SEPARATE AI stream at
+  // arrival and stored (§4.3); arrival needs come from the same stream.
+  const ai = deriveAiProfile(rngSeed, arrivalIndex, traitId);
   return {
     species,
     name: SPECIES[species].defaultName,
@@ -68,6 +76,9 @@ function makeRescue(
     traitSource: 'rolled',
     favBonusCount: 0,
     favBonusLastDate: null,
+    needs: ai.arrivalNeeds,
+    aiProfile: { weights: ai.weights, metabolism: ai.metabolism, aiSeed: ai.aiSeed },
+    aiProfileSource: 'rolled',
   };
 }
 
@@ -87,7 +98,45 @@ function freshState(seed: number = newMasterSeed()): GameState {
     adopterCooldowns: {},
     lastOfferIds: [],
     lastStoryTemplateIds: null,
+    lastSeenAt: Date.now(),
   };
+}
+
+/** Apply the §1.3 absence catch-up to a freshly loaded/imported state:
+ * needs ease toward "ready for company" — never below the floor of 35,
+ * never a punishment. Pre-v5 saves (no lastSeenAt) skip it entirely. */
+function withLoadCatchUp(state: GameState): GameState {
+  if (!state.current.needs || typeof state.lastSeenAt !== 'number') return state;
+  const elapsed = (Date.now() - state.lastSeenAt) / 1000;
+  if (!(elapsed > 0)) return state;
+  const adjusted = absenceCatchUp(state.current.needs, elapsed);
+  const changed = (Object.keys(adjusted) as (keyof Needs)[]).some(
+    (k) => Math.abs(adjusted[k] - state.current.needs![k]) > 0.001,
+  );
+  if (!changed) return state;
+  return { ...state, current: { ...state.current, needs: adjusted } };
+}
+
+/** Debug readout (UTILITY-AI-DEEP-DIVE §8 D-checks): ?debug=1 shows the
+ * needs/action/scores panel and exposes window.__yard for probes. */
+const DEBUG =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).has('debug');
+
+/** Has anything the player can see changed between two sim snapshots?
+ * Positions compare at half-unit grain (the CSS transition smooths the
+ * rest); the debug panel additionally wants the numbers every tick. */
+function simViewChanged(a: SimSnapshot | null, b: SimSnapshot): boolean {
+  if (!a) return true;
+  if (a.instanceId !== b.instanceId || a.mode !== b.mode) return true;
+  if ((a.action?.defId ?? '') !== (b.action?.defId ?? '')) return true;
+  if ((a.action?.phase ?? '') !== (b.action?.phase ?? '')) return true;
+  if (a.thought !== b.thought) return true;
+  if (Math.abs(a.x - b.x) > 0.5 || Math.abs(a.y - b.y) > 0.5) return true;
+  const grain = DEBUG ? 0.05 : 0.5;
+  return (Object.keys(b.needs) as (keyof Needs)[]).some(
+    (k) => Math.abs(a.needs[k] - b.needs[k]) > grain,
+  );
 }
 
 type View = { kind: 'sanctuary' } | { kind: 'album' } | { kind: 'visit'; entryId: string };
@@ -111,17 +160,62 @@ export default function App() {
   const gameRef = useRef<GameState | null>(null);
   gameRef.current = game;
 
+  /* ---------- Phase 2: the yard sim (one resident, step 1) ----------
+   * The sim is runtime state, rebuilt per resident from the save's stored
+   * needs + aiProfile. It owns needs while it lives; commits copy its
+   * needs back into the document (see commit/syncFromSim). */
+  const simRef = useRef<YardSim | null>(null);
+  const simForRef = useRef<string | null>(null);
+  const [simView, setSimView] = useState<SimSnapshot | null>(null);
+  const [simEpoch, setSimEpoch] = useState(0);
+  const commitRef = useRef<(next: GameState) => void>(() => {});
+
+  const ensureSim = useCallback((state: GameState): YardSim => {
+    const cur = state.current;
+    if (simRef.current && simForRef.current === cur.instanceId) {
+      return simRef.current;
+    }
+    const traitId = (cur.traitId as TraitId | null) ?? null;
+    const derived = deriveAiProfile(
+      state.rngSeed,
+      state.arrivalIndex,
+      traitId ?? 'gentle',
+    );
+    const sim = new YardSim({
+      instanceId: cur.instanceId,
+      traitId,
+      weights: cur.aiProfile?.weights ?? derived.weights,
+      metabolism: cur.aiProfile?.metabolism ?? derived.metabolism,
+      needs: cur.needs ?? derived.arrivalNeeds,
+      rngSeed: state.rngSeed,
+      arrivalIndex: state.arrivalIndex,
+    });
+    simRef.current = sim;
+    simForRef.current = cur.instanceId;
+    return sim;
+  }, []);
+
+  /** Copy the sim's live needs into a state about to be saved — but only
+   * when the sim belongs to that state's resident (a Fresh Start or a new
+   * arrival must never inherit the old resident's needs). */
+  const syncFromSim = useCallback((state: GameState): GameState => {
+    const sim = simRef.current;
+    if (!sim || simForRef.current !== state.current.instanceId) return state;
+    return { ...state, current: { ...state.current, needs: sim.getNeeds() } };
+  }, []);
+
   /* ---------- load once: migrate in memory BEFORE any write (F1 fencing) */
   useEffect(() => {
     const result = loadSave(STORAGE);
     if (result.status === 'ok') {
-      setGame(result.state);
-      const prefs = audioPrefsOf(result.state);
+      const caught = withLoadCatchUp(result.state);
+      setGame(caught);
+      const prefs = audioPrefsOf(caught);
       setAudioPrefs(prefs);
-      Snd.loadPrefs(prefs, result.state.rngSeed);
-      if (result.migratedFrom < CURRENT_SAVE_VERSION) {
+      Snd.loadPrefs(prefs, caught.rngSeed);
+      if (result.migratedFrom < CURRENT_SAVE_VERSION || caught !== result.state) {
         try {
-          saveSave(STORAGE, result.state);
+          saveSave(STORAGE, caught);
         } catch {
           /* the in-memory state is still good; the next commit retries */
         }
@@ -144,18 +238,30 @@ export default function App() {
     }
   }, []);
 
-  /* ---------- commit: set state + debounced whole-document write */
-  const commit = useCallback((next: GameState) => {
-    setGame(next);
-    window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(() => {
-      try {
-        saveSave(STORAGE, next);
-      } catch {
-        /* state stays in memory; a later commit retries */
-      }
-    }, 300);
-  }, []);
+  /* ---------- commit: set state + debounced whole-document write.
+     Every commit syncs the sim's needs in and stamps lastSeenAt (the
+     §1.3 catch-up clock) — needs ride the normal autosave cadence,
+     never a per-tick write (§7.3). */
+  const commit = useCallback(
+    (next: GameState) => {
+      const out: GameState = {
+        ...syncFromSim(next),
+        lastSeenAt: Date.now(),
+      };
+      setGame(out);
+      gameRef.current = out;
+      window.clearTimeout(saveTimer.current);
+      saveTimer.current = window.setTimeout(() => {
+        try {
+          saveSave(STORAGE, out);
+        } catch {
+          /* state stays in memory; a later commit retries */
+        }
+      }, 300);
+    },
+    [syncFromSim],
+  );
+  commitRef.current = commit;
 
   /* flush the pending write when the page goes away */
   useEffect(() => {
@@ -163,7 +269,10 @@ export default function App() {
       window.clearTimeout(saveTimer.current);
       if (gameRef.current) {
         try {
-          saveSave(STORAGE, gameRef.current);
+          saveSave(STORAGE, {
+            ...syncFromSim(gameRef.current),
+            lastSeenAt: Date.now(),
+          });
         } catch {
           /* noop */
         }
@@ -216,6 +325,60 @@ export default function App() {
     }
   }, [game?.phase]);
 
+  /* ---------- Phase 2 driver: step the sim on a 100 ms cadence while
+     the sanctuary yard is on screen, publish snapshots for rendering
+     (only when something visible changed), and sync needs into the save
+     on the autosave cadence. Sim time is real elapsed time at 1× — a
+     hidden tab simply stops stepping (no catch-up burst, §7.2). */
+  const currentInstanceId = game?.current.instanceId;
+  useEffect(() => {
+    if (view.kind !== 'sanctuary' || !gameRef.current || !currentInstanceId) return;
+    const sim = ensureSim(gameRef.current);
+    setSimView(sim.snapshot());
+    // Date.now (not performance.now): the probes drive the yard with
+    // Playwright's mocked clock, which fakes Date/timers but not
+    // performance.now — an elapsed pump on performance.now would crawl
+    // at real-time microseconds under fastForward. The 0.5 s dt clamp
+    // bounds any wall-clock jump.
+    let last = Date.now();
+    let lastSync = Date.now();
+    const iv = window.setInterval(() => {
+      const now = Date.now();
+      const dt = Math.min(0.5, Math.max(0, (now - last) / 1000));
+      last = now;
+      if (dt > 0) sim.step(dt);
+      const snap = sim.snapshot();
+      setSimView((prev) => (simViewChanged(prev, snap) ? snap : prev));
+      if (now - lastSync > 5000) {
+        lastSync = now;
+        const g = gameRef.current;
+        if (g && g.current.instanceId === sim.instanceId) {
+          const saved = g.current.needs;
+          const drifted =
+            !saved ||
+            (Object.keys(snap.needs) as (keyof Needs)[]).some(
+              (k) => Math.abs(snap.needs[k] - saved[k]) > 0.5,
+            );
+          if (drifted) commitRef.current({ ...g });
+        }
+      }
+    }, 100);
+    return () => window.clearInterval(iv);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [view.kind, currentInstanceId, simEpoch, ensureSim]);
+
+  /* debug handle for the §8 D-check probes */
+  useEffect(() => {
+    if (!DEBUG) return;
+    const w = window as unknown as { __yard?: unknown };
+    w.__yard = {
+      sim: () => simRef.current,
+      snapshot: () => simRef.current?.snapshot() ?? null,
+      step: (seconds: number) => simRef.current?.step(seconds),
+      events: () => simRef.current?.events ?? [],
+    };
+  }, []);
+
   const current = game?.current;
   const currentTrait =
     current && current.traitId && current.traitId in TRAITS
@@ -242,6 +405,13 @@ export default function App() {
     const stage = stageRef.current;
     stage?.react(action);
     stage?.wake();
+
+    // Phase 2: the tap is also a sim intent (§3.5) — autonomy yields,
+    // the need refill lands instantly with the hearts/coins below, and
+    // commit() syncs the sim's needs into the same document write.
+    if (simRef.current && simForRef.current === current.instanceId) {
+      simRef.current.applyCare(action);
+    }
 
     const isFav = !!currentTrait && currentTrait.loves === action;
     const bonus = isFav && bonusAvailable;
@@ -441,6 +611,12 @@ export default function App() {
     // Fresh Start does NOT reset audio prefs (§8.3) — they ride along.
     Snd.play('ui.close'); // a door closing gently — no dramatic sting (§1.3)
     const fresh: GameState = { ...freshState(), settings: { audio: Snd.getPrefs() } };
+    // The old resident's sim must not leak into the new sanctuary (its
+    // first rescue reuses instanceId 'arr-1'): drop it before committing.
+    simRef.current = null;
+    simForRef.current = null;
+    setSimView(null);
+    setSimEpoch((e) => e + 1);
     setView({ kind: 'sanctuary' });
     setConfirmReset(false);
     setLoadIssue(null);
@@ -461,9 +637,15 @@ export default function App() {
       const prefs = audioPrefsOf(result.state);
       setAudioPrefs(prefs);
       Snd.loadPrefs(prefs, result.state.rngSeed);
-      commit(result.state);
+      // Same rule as Fresh Start: the replaced sanctuary gets a fresh sim.
+      simRef.current = null;
+      simForRef.current = null;
+      setSimView(null);
+      setSimEpoch((e) => e + 1);
+      const caught = withLoadCatchUp(result.state);
+      commit(caught);
       try {
-        saveSave(STORAGE, result.state);
+        saveSave(STORAGE, caught);
       } catch {
         /* noop */
       }
@@ -531,6 +713,19 @@ export default function App() {
   const visitEntry =
     view.kind === 'visit' ? game.album.find((e) => e.id === view.entryId) : undefined;
 
+  /* Phase 2 yard view state: the sim snapshot for THIS resident (a stale
+   * snapshot from a previous resident is never rendered). */
+  const simForCurrent = !!simView && simView.instanceId === current.instanceId;
+  const walkerX = simForCurrent ? simView.x : 50;
+  const walkerY = simForCurrent ? simView.y : 55;
+  const simSleep: SleepState | undefined = !simForCurrent
+    ? undefined
+    : simView.mode === 'acting' && simView.action?.defId === 'bed'
+      ? 'asleep'
+      : simView.mode === 'acting' && simView.action?.defId === 'cuddle-rug'
+        ? 'sleepy'
+        : 'awake';
+
   return (
     <Shell>
       <header className="relative flex items-center justify-between mb-3">
@@ -583,18 +778,54 @@ export default function App() {
 
       {view.kind === 'sanctuary' && (
         <>
-          <section className="relative rounded-3xl bg-gradient-to-b from-sky-200 via-green-100 to-green-200 border border-green-200 shadow-sm px-4 pt-12 pb-4 overflow-hidden">
-            <div className="max-w-sm mx-auto">
-              <AnimalStage
-                key={current.instanceId}
-                ref={stageRef}
-                species={current.species as SpeciesId}
-                outfit={current.outfit}
-                instanceId={current.instanceId}
-                traitId={current.traitId}
-                idle
-                initialLine={currentTrait ? currentTrait.kidLine : null}
-              />
+          <section className="relative rounded-3xl bg-gradient-to-b from-sky-200 via-green-100 to-green-200 border border-green-200 shadow-sm px-4 pt-10 pb-4 overflow-hidden">
+            {/* Phase 2 yard: advertiser props at their sim anchors, and
+                the resident walking between them (the walker is an HTML
+                wrapper — the rig's transforms are never touched). */}
+            <div className="relative mx-auto w-full max-w-[540px] h-[430px]" data-yard>
+              {YARD_LAYOUT.map((inst) => (
+                <div
+                  key={inst.key}
+                  className="absolute w-[84px]"
+                  style={{
+                    left: `${inst.x}%`,
+                    top: `${inst.y}%`,
+                    transform: 'translate(-50%, -82%)',
+                  }}
+                  data-prop={inst.def.id}
+                >
+                  <YardProp defId={inst.def.id} />
+                </div>
+              ))}
+              <div
+                className="yard-walker absolute w-[36%]"
+                style={{
+                  left: `${walkerX}%`,
+                  top: `${walkerY}%`,
+                  transform: 'translate(-50%, -84%)',
+                }}
+              >
+                <AnimalStage
+                  key={current.instanceId}
+                  ref={stageRef}
+                  species={current.species as SpeciesId}
+                  outfit={current.outfit}
+                  instanceId={current.instanceId}
+                  traitId={current.traitId}
+                  idle
+                  initialLine={currentTrait ? currentTrait.kidLine : null}
+                  sleepOverride={simSleep}
+                />
+                {simForCurrent && simView.thought && (
+                  <div
+                    className="absolute -top-2 right-0 z-20 rounded-full bg-white border border-amber-200 shadow px-2 py-1 text-lg animate-pop-in"
+                    data-thought={simView.thought}
+                    aria-hidden
+                  >
+                    {NEED_ICONS[simView.thought]}
+                  </div>
+                )}
+              </div>
             </div>
           </section>
 
@@ -824,6 +1055,31 @@ export default function App() {
           </button>
         )}
       </footer>
+
+      {DEBUG && simView && (
+        <div
+          className="fixed left-2 bottom-2 z-50 rounded-xl bg-white/95 border border-stone-300 shadow px-3 py-2 text-[11px] font-mono leading-relaxed text-stone-700"
+          data-testid="yard-debug"
+        >
+          <div>
+            ⏱ {simView.time.toFixed(1)}s · {simView.mode}
+            {simView.action
+              ? ` · ${simView.action.phase} → ${simView.action.defId}`
+              : ''}{' '}
+            · decisions {simView.decisionCount}
+          </div>
+          <div>
+            🍖 {simView.needs.tummy.toFixed(1)} · 💤 {simView.needs.energy.toFixed(1)} · 🫧{' '}
+            {simView.needs.clean.toFixed(1)} · 🎾 {simView.needs.fun.toFixed(1)} · ❤️{' '}
+            {simView.needs.affection.toFixed(1)}
+          </div>
+          <div>
+            top:{' '}
+            {simView.topScores.map((s) => `${s.id} ${s.score.toFixed(2)}`).join(' · ') ||
+              '—'}
+          </div>
+        </div>
+      )}
     </Shell>
   );
 }

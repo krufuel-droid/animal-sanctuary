@@ -5,12 +5,17 @@ import {
   TRAIT_IDS,
   gameStateSchema,
   type GameState,
+  type SavedAiProfile,
+  type SavedNeeds,
   type SpeciesId,
   type TraitId,
 } from './schema';
+import { deriveAiProfile } from '../sim/traits-ai';
+import { NEED_IDS } from '../sim/needs';
 
-// Client-side migration chain, v1 → v4 (PHASE1-DEEP-DIVE §4.1: the artifact's
-// chain moves as-is; PHASE0-DEEP-DIVE §B5/§B.6.4/§B.6.5: the step rules).
+// Client-side migration chain, v1 → v5 (PHASE1-DEEP-DIVE §4.1: the artifact's
+// chain moves as-is; PHASE0-DEEP-DIVE §B5/§B.6.4/§B.6.5: the step rules;
+// UTILITY-AI-DEEP-DIVE §7.3: the v4 → v5 autonomy step).
 //
 // Laws, from CODE-AUDIT.md F1 and the specs:
 //  - Migration runs fully in memory and is written back only on success.
@@ -64,6 +69,36 @@ function typicalTraitFor(species: unknown): TraitId {
     return SPECIES_TYPICAL_TRAIT[species as SpeciesId];
   }
   return 'gentle';
+}
+
+/** A stored needs record is kept as-is (finite values clamped into range);
+ * anything malformed is regenerated from the AI stream instead. */
+function keptNeeds(v: unknown): SavedNeeds | null {
+  if (!isRecord(v)) return null;
+  const out = {} as SavedNeeds;
+  for (const n of NEED_IDS) {
+    const val = v[n];
+    if (typeof val !== 'number' || !Number.isFinite(val)) return null;
+    out[n] = Math.min(100, Math.max(0, val));
+  }
+  return out;
+}
+
+/** A stored aiProfile is a resolved outcome (§4.3): kept verbatim when
+ * well-formed, never re-derived. */
+function keptAiProfile(v: unknown): SavedAiProfile | null {
+  if (!isRecord(v) || !isRecord(v.weights)) return null;
+  const weights = {} as SavedAiProfile['weights'];
+  for (const n of NEED_IDS) {
+    const val = v.weights[n];
+    if (typeof val !== 'number' || !Number.isFinite(val)) return null;
+    weights[n] = val;
+  }
+  if (typeof v.metabolism !== 'number' || !Number.isFinite(v.metabolism)) {
+    return null;
+  }
+  if (!isInt(v.aiSeed) || v.aiSeed < 0 || v.aiSeed > 4294967295) return null;
+  return { weights, metabolism: v.metabolism, aiSeed: v.aiSeed };
 }
 
 /** Legacy album fallback copy (PHASE0-DEEP-DIVE §B.6.4) — true of every
@@ -120,6 +155,25 @@ export function migrateSave(
   const rngSeed = isInt(raw.rngSeed) ? raw.rngSeed : deps.newSeed();
 
   const currentTrait = normalizeTraitId(cur.traitId);
+  const resolvedTraitId: TraitId = currentTrait ?? typicalTraitFor(cur.species);
+
+  // --- v4 → v5 (Phase 2 step 1, §7.3): autonomy state for the CURRENT
+  // rescue only — album entries are history and get nothing. Missing or
+  // malformed fields are generated via the rescue's AI stream (its
+  // traitId is NOT touched); well-formed stored values are kept verbatim.
+  const keptProfile = keptAiProfile(cur.aiProfile);
+  const keptNeedsValue = keptNeeds(cur.needs);
+  const derived =
+    keptProfile && keptNeedsValue
+      ? null
+      : deriveAiProfile(rngSeed, arrivalIndex, resolvedTraitId);
+  const aiProfile: SavedAiProfile = keptProfile ?? {
+    weights: derived!.weights,
+    metabolism: derived!.metabolism,
+    aiSeed: derived!.aiSeed,
+  };
+  const rescueNeeds: SavedNeeds = keptNeedsValue ?? derived!.arrivalNeeds;
+
   const current = {
     species: cur.species,
     name: cur.name,
@@ -129,7 +183,7 @@ export function migrateSave(
       typeof cur.instanceId === 'string' ? cur.instanceId : deps.newId(),
     // A mid-bond rescue keeps the trait it already has; only a missing or
     // unrecognised one takes the species-typical migration default.
-    traitId: currentTrait ?? typicalTraitFor(cur.species),
+    traitId: resolvedTraitId,
     traitSeed: isInt(cur.traitSeed)
       ? cur.traitSeed
       : fnv1a(`migration:${cur.species}:${cur.name}`),
@@ -140,6 +194,14 @@ export function migrateSave(
     favBonusCount: isInt(cur.favBonusCount) ? cur.favBonusCount : 0,
     favBonusLastDate:
       typeof cur.favBonusLastDate === 'string' ? cur.favBonusLastDate : null,
+    needs: rescueNeeds,
+    aiProfile,
+    aiProfileSource:
+      keptProfile && typeof cur.aiProfileSource === 'string'
+        ? cur.aiProfileSource
+        : keptProfile
+          ? 'rolled'
+          : 'migration',
   };
 
   // --- Album: v1 → v2 (trait snapshot) and → v3/v4 (adopter fallbacks).
@@ -234,6 +296,10 @@ export function migrateSave(
     lastStoryTemplateIds: isRecord(raw.lastStoryTemplateIds)
       ? raw.lastStoryTemplateIds
       : null,
+    // v5 root: carried when present; absent (pre-v5) saves get null, which
+    // the loader reads as "never seen by the autonomy engine" — no
+    // absence catch-up is applied to them.
+    lastSeenAt: typeof raw.lastSeenAt === 'number' ? raw.lastSeenAt : null,
     // Sound prefs ride through every migration untouched (§8.3): they are
     // parent/device settings, and the field-by-field rebuild above must
     // never drop them. The schema validates the shape; audioPrefsOf merges
@@ -241,7 +307,7 @@ export function migrateSave(
     ...(isRecord(raw.settings) ? { settings: raw.settings } : {}),
   };
 
-  // Final gate: the migrated shape must satisfy the v4 contract. If it does
+  // Final gate: the migrated shape must satisfy the current contract. If it does
   // not, the blob is corrupt — report it, write nothing.
   const parsed = gameStateSchema.safeParse(candidate);
   if (!parsed.success) return { status: 'invalid' };

@@ -190,14 +190,17 @@ export const AnimalStage = forwardRef<
     traitId: TraitId | string | null;
     idle: boolean;
     initialLine?: string | null;
+    /** Phase 2: the yard sim's sleep pose, when it is driving this stage. */
+    sleepOverride?: SleepState | null;
   }
->(function AnimalStage({ species, outfit, instanceId, traitId, idle, initialLine }, ref) {
+>(function AnimalStage({ species, outfit, instanceId, traitId, idle, initialLine, sleepOverride }, ref) {
   const svgRef = useRef<HTMLDivElement | null>(null);
   const idleCtl = useIdle(svgRef, {
     species,
     instanceId,
     traitId: traitId && traitId in TRAITS ? (traitId as TraitId) : null,
     enabled: idle,
+    sleepOverride: sleepOverride ?? null,
   });
   const [bubble, setBubble] = useState<{ text: string; key: number } | null>(
     initialLine ? { text: initialLine, key: 0 } : null,

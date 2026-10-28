@@ -71,14 +71,33 @@ export interface UseIdleOptions {
   instanceId: string;
   traitId: TraitId | null;
   enabled: boolean;
+  /**
+   * Phase 2: when the yard sim is driving, IT owns the sleep pose (rest at
+   * the bed = asleep, cuddle rug = sleepy). While an override is supplied,
+   * the idle engine's own doze state machine stands down and its channels
+   * gate on the override (dream twitches at the bed, no breakers) — the
+   * Phase 0 behaviour is unchanged wherever no override is passed (visits).
+   */
+  sleepOverride?: SleepState | null;
 }
 
 export function useIdle(
   rootRef: RefObject<Element | null>,
-  { species, instanceId, traitId, enabled }: UseIdleOptions,
+  { species, instanceId, traitId, enabled, sleepOverride }: UseIdleOptions,
 ) {
   const [sleep, setSleep] = useState<SleepState>('awake');
   const sleepRef = useRef<SleepState>('awake');
+  const overrideRef = useRef<SleepState | null>(sleepOverride ?? null);
+  overrideRef.current = sleepOverride ?? null;
+
+  // Sync the override into the same state the engine reads (sleepRef drives
+  // channel gating inside the scheduler; `sleep` drives the render).
+  useEffect(() => {
+    if (sleepOverride != null) {
+      sleepRef.current = sleepOverride;
+      setSleep(sleepOverride);
+    }
+  }, [sleepOverride]);
   const lastTapAt = useRef<number>(Date.now());
   const profileRef = useRef<IdleProfile>(deriveProfile(instanceId, traitId));
   profileRef.current = deriveProfile(instanceId, traitId);
@@ -386,8 +405,10 @@ export function useIdle(
     schedule();
 
     // Sleep state machine (§B.6.4): awake → sleepy → asleep on no taps.
+    // Stands down entirely while the yard sim owns the pose (override set).
     const onsetMs = rand(p.sleepOnset) * 1000 * profile.sleepiness;
     const sleepTimer = window.setInterval(() => {
+      if (overrideRef.current != null) return;
       const idleFor = Date.now() - lastTapAt.current;
       if (sleepRef.current === 'awake' && idleFor >= onsetMs) setSleepBoth('sleepy');
       else if (sleepRef.current === 'sleepy' && idleFor >= onsetMs + 32000) setSleepBoth('asleep');
