@@ -5,6 +5,7 @@ import {
   TRAIT_IDS,
   gameStateSchema,
   type GameState,
+  type Rescue,
   type SavedAiProfile,
   type SavedNeeds,
   type SpeciesId,
@@ -13,9 +14,12 @@ import {
 import { deriveAiProfile } from '../sim/traits-ai';
 import { NEED_IDS } from '../sim/needs';
 
-// Client-side migration chain, v1 → v5 (PHASE1-DEEP-DIVE §4.1: the artifact's
+// Client-side migration chain, v1 → v6 (PHASE1-DEEP-DIVE §4.1: the artifact's
 // chain moves as-is; PHASE0-DEEP-DIVE §B5/§B.6.4/§B.6.5: the step rules;
-// UTILITY-AI-DEEP-DIVE §7.3: the v4 → v5 autonomy step).
+// UTILITY-AI-DEEP-DIVE §7.3: the v4 → v5 autonomy step; Phase 2 step 2B:
+// the v5 → v6 residents step — the old current rescue becomes
+// residents[0], value-identical, and a frozen pendingAdoption learns
+// which resident it belongs to).
 //
 // Laws, from CODE-AUDIT.md F1 and the specs:
 //  - Migration runs fully in memory and is written back only on success.
@@ -137,15 +141,30 @@ export function migrateSave(
   if (raw.phase !== undefined && raw.phase !== 'caring' && raw.phase !== 'celebration') {
     return { status: 'invalid' };
   }
-  if (!isRecord(raw.current)) return { status: 'invalid' };
   if (!Array.isArray(raw.album)) return { status: 'invalid' };
 
-  const cur = raw.current;
-  if (typeof cur.species !== 'string' || typeof cur.name !== 'string') {
+  // --- v5 → v6 (Phase 2 step 2B): the residents list. A v6 save carries
+  // `residents`; every older save carries the single `current` rescue,
+  // which becomes residents[0]. Each record passes the same basic shape
+  // checks the single rescue always did — a bad record is a corrupt blob.
+  const residentRecords: Record<string, unknown>[] = [];
+  if (Array.isArray(raw.residents) && raw.residents.length > 0) {
+    for (const rec of raw.residents) {
+      if (!isRecord(rec)) return { status: 'invalid' };
+      residentRecords.push(rec);
+    }
+  } else if (isRecord(raw.current)) {
+    residentRecords.push(raw.current);
+  } else {
     return { status: 'invalid' };
   }
-  if (!isInt(cur.hearts) || cur.hearts < 0 || cur.hearts > 8) {
-    return { status: 'invalid' };
+  for (const rec of residentRecords) {
+    if (typeof rec.species !== 'string' || typeof rec.name !== 'string') {
+      return { status: 'invalid' };
+    }
+    if (!isInt(rec.hearts) || rec.hearts < 0 || rec.hearts > 8) {
+      return { status: 'invalid' };
+    }
   }
 
   // --- v1 → v2 (stage 2a): personality data core.
@@ -154,55 +173,79 @@ export function migrateSave(
     : adoptedCount;
   const rngSeed = isInt(raw.rngSeed) ? raw.rngSeed : deps.newSeed();
 
-  const currentTrait = normalizeTraitId(cur.traitId);
-  const resolvedTraitId: TraitId = currentTrait ?? typicalTraitFor(cur.species);
-
-  // --- v4 → v5 (Phase 2 step 1, §7.3): autonomy state for the CURRENT
-  // rescue only — album entries are history and get nothing. Missing or
-  // malformed fields are generated via the rescue's AI stream (its
-  // traitId is NOT touched); well-formed stored values are kept verbatim.
-  const keptProfile = keptAiProfile(cur.aiProfile);
-  const keptNeedsValue = keptNeeds(cur.needs);
-  const derived =
-    keptProfile && keptNeedsValue
-      ? null
-      : deriveAiProfile(rngSeed, arrivalIndex, resolvedTraitId);
-  const aiProfile: SavedAiProfile = keptProfile ?? {
-    weights: derived!.weights,
-    metabolism: derived!.metabolism,
-    aiSeed: derived!.aiSeed,
+  /** A resident's own arrival number, for its AI stream (§4.3 keys the
+   * stream on rngSeed + arrivalIndex). Residents minted by the game are
+   * `arr-<n>`; the primary resident of an older save IS the root counter. */
+  const arrivalIndexFor = (
+    rec: Record<string, unknown>,
+    position: number,
+  ): number => {
+    if (typeof rec.instanceId === 'string') {
+      const m = /^arr-(\d+)$/.exec(rec.instanceId);
+      if (m) return Number(m[1]);
+    }
+    return position === 0 ? arrivalIndex : arrivalIndex + position;
   };
-  const rescueNeeds: SavedNeeds = keptNeedsValue ?? derived!.arrivalNeeds;
 
-  const current = {
-    species: cur.species,
-    name: cur.name,
-    hearts: cur.hearts,
-    outfit: typeof cur.outfit === 'string' ? cur.outfit : null,
-    instanceId:
-      typeof cur.instanceId === 'string' ? cur.instanceId : deps.newId(),
-    // A mid-bond rescue keeps the trait it already has; only a missing or
-    // unrecognised one takes the species-typical migration default.
-    traitId: resolvedTraitId,
-    traitSeed: isInt(cur.traitSeed)
-      ? cur.traitSeed
-      : fnv1a(`migration:${cur.species}:${cur.name}`),
-    traitSource:
-      typeof cur.traitSource === 'string' && currentTrait !== null
-        ? cur.traitSource
-        : 'migration-default',
-    favBonusCount: isInt(cur.favBonusCount) ? cur.favBonusCount : 0,
-    favBonusLastDate:
-      typeof cur.favBonusLastDate === 'string' ? cur.favBonusLastDate : null,
-    needs: rescueNeeds,
-    aiProfile,
-    aiProfileSource:
-      keptProfile && typeof cur.aiProfileSource === 'string'
-        ? cur.aiProfileSource
-        : keptProfile
-          ? 'rolled'
-          : 'migration',
+  /** Normalize one rescue record — the v1→v5 per-rescue steps, unchanged:
+   * a mid-bond rescue keeps the trait it already has (only a missing or
+   * unrecognised one takes the species-typical migration default), and
+   * v4 → v5 autonomy state is generated via the rescue's OWN AI stream
+   * when missing or malformed — well-formed stored values are kept
+   * verbatim, never re-derived. Album entries get none of this (§7.3). */
+  const normalizeResident = (
+    cur: Record<string, unknown>,
+    position: number,
+  ): Rescue => {
+    const currentTrait = normalizeTraitId(cur.traitId);
+    const resolvedTraitId: TraitId =
+      currentTrait ?? typicalTraitFor(cur.species);
+    const keptProfile = keptAiProfile(cur.aiProfile);
+    const keptNeedsValue = keptNeeds(cur.needs);
+    const derived =
+      keptProfile && keptNeedsValue
+        ? null
+        : deriveAiProfile(
+            rngSeed,
+            arrivalIndexFor(cur, position),
+            resolvedTraitId,
+          );
+    const aiProfile: SavedAiProfile = keptProfile ?? {
+      weights: derived!.weights,
+      metabolism: derived!.metabolism,
+      aiSeed: derived!.aiSeed,
+    };
+    const rescueNeeds: SavedNeeds = keptNeedsValue ?? derived!.arrivalNeeds;
+    return {
+      species: cur.species as string,
+      name: cur.name as string,
+      hearts: cur.hearts as number,
+      outfit: typeof cur.outfit === 'string' ? cur.outfit : null,
+      instanceId:
+        typeof cur.instanceId === 'string' ? cur.instanceId : deps.newId(),
+      traitId: resolvedTraitId,
+      traitSeed: isInt(cur.traitSeed)
+        ? cur.traitSeed
+        : fnv1a(`migration:${cur.species}:${cur.name}`),
+      traitSource:
+        typeof cur.traitSource === 'string' && currentTrait !== null
+          ? (cur.traitSource as Rescue['traitSource'])
+          : 'migration-default',
+      favBonusCount: isInt(cur.favBonusCount) ? cur.favBonusCount : 0,
+      favBonusLastDate:
+        typeof cur.favBonusLastDate === 'string' ? cur.favBonusLastDate : null,
+      needs: rescueNeeds,
+      aiProfile,
+      aiProfileSource:
+        keptProfile && typeof cur.aiProfileSource === 'string'
+          ? (cur.aiProfileSource as Rescue['aiProfileSource'])
+          : keptProfile
+            ? 'rolled'
+            : 'migration',
+    };
   };
+
+  const residents = residentRecords.map((rec, i) => normalizeResident(rec, i));
 
   // --- Album: v1 → v2 (trait snapshot) and → v3/v4 (adopter fallbacks).
   const album: unknown[] = [];
@@ -270,6 +313,19 @@ export function migrateSave(
     });
   }
 
+  // --- v5 → v6: a frozen offer learns its resident. An older save's
+  // pending adoption is necessarily about its single rescue —
+  // residents[0]; a v6 blob's stored reference is kept as-is.
+  const pendingAdoption = isRecord(raw.pendingAdoption)
+    ? {
+        ...raw.pendingAdoption,
+        residentInstanceId:
+          typeof raw.pendingAdoption.residentInstanceId === 'string'
+            ? raw.pendingAdoption.residentInstanceId
+            : residents[0].instanceId,
+      }
+    : null;
+
   // --- v3 → v4 (stage 3b): matching state at the root.
   const candidate = {
     version: CURRENT_SAVE_VERSION,
@@ -280,13 +336,11 @@ export function migrateSave(
     adoptedCount,
     rotationIndex,
     phase: raw.phase === 'celebration' ? 'celebration' : 'caring',
-    current,
+    residents,
     album,
     rngSeed,
     arrivalIndex,
-    pendingAdoption: isRecord(raw.pendingAdoption)
-      ? raw.pendingAdoption
-      : null,
+    pendingAdoption,
     adopterCooldowns: isRecord(raw.adopterCooldowns)
       ? raw.adopterCooldowns
       : {},

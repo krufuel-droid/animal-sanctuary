@@ -82,9 +82,9 @@ function migratedV1() {
 }
 
 describe('A1 — the wipe drill: a v1 save migrates intact', () => {
-  it('preserves every player-visible fact and stamps v5', () => {
+  it('preserves every player-visible fact and stamps v6', () => {
     const state = migratedV1();
-    expect(state.version).toBe(5);
+    expect(state.version).toBe(6);
     expect(state.coins).toBe(137);
     expect(state.ownedItems).toEqual(['bow', 'scarf']);
     expect(state.adoptedCount).toBe(2);
@@ -94,18 +94,18 @@ describe('A1 — the wipe drill: a v1 save migrates intact', () => {
     // Stories are frozen text — byte-identical after migration.
     expect(state.album[0].story).toBe(V1_SAVE.album[0].story);
     expect(state.album[1].story).toBe(V1_SAVE.album[1].story);
-    expect(state.current.name).toBe('Clover');
-    expect(state.current.hearts).toBe(5);
-    expect(state.current.outfit).toBe('bow');
+    expect(state.residents[0].name).toBe('Clover');
+    expect(state.residents[0].hearts).toBe(5);
+    expect(state.residents[0].outfit).toBe('bow');
   });
 
   it('gives the mid-bond rescue its species-typical trait, deterministically', () => {
     const state = migratedV1();
-    expect(state.current.traitId).toBe('shy'); // bunny typical (§B4)
-    expect(state.current.traitSource).toBe('migration-default');
-    expect(state.current.traitSeed).toBe(fnv1a('migration:bunny:Clover'));
-    expect(state.current.favBonusCount).toBe(0);
-    expect(state.current.favBonusLastDate).toBeNull();
+    expect(state.residents[0].traitId).toBe('shy'); // bunny typical (§B4)
+    expect(state.residents[0].traitSource).toBe('migration-default');
+    expect(state.residents[0].traitSeed).toBe(fnv1a('migration:bunny:Clover'));
+    expect(state.residents[0].favBonusCount).toBe(0);
+    expect(state.residents[0].favBonusLastDate).toBeNull();
     expect(state.rngSeed).toBe(123456789);
     expect(state.arrivalIndex).toBe(2); // = adoptedCount (audit F9)
   });
@@ -145,7 +145,7 @@ describe('A1 — the wipe drill: a v1 save migrates intact', () => {
 });
 
 describe('A2 — round-trip: new fields actually persist (the strip test)', () => {
-  it('writes the whole v5 document and reads it back equal', () => {
+  it('writes the whole v6 document and reads it back equal', () => {
     const storage = new FakeStorage();
     const state = migratedV1();
     saveSave(storage, state);
@@ -211,6 +211,7 @@ describe('A4 — a frozen mid-choice adoption survives the move', () => {
     const state = migratedV1();
     state.phase = 'celebration';
     state.pendingAdoption = {
+      residentInstanceId: state.residents[0].instanceId,
       animalSnapshot: {
         name: 'Pip',
         species: 'duck',
@@ -241,11 +242,14 @@ describe('H10 — v4 → v5 migration (UTILITY-AI-DEEP-DIVE §7.3/§8)', () => {
   // stripped back off and the version restamped — plus the SND-1 audio
   // prefs and a frozen mid-choice adoption, the two easiest things to lose.
   function v4Fixture() {
-    const v5 = migratedV1();
-    const raw = structuredClone(v5) as unknown as Record<string, unknown>;
+    const v6 = migratedV1();
+    const raw = structuredClone(v6) as unknown as Record<string, unknown>;
     raw.version = 4;
     delete raw.lastSeenAt;
-    const cur = raw.current as Record<string, unknown>;
+    // v4 predates the residents list: residents[0] was the `current` record.
+    const cur = (raw.residents as Record<string, unknown>[])[0];
+    raw.current = cur;
+    delete raw.residents;
     delete cur.needs;
     delete cur.aiProfile;
     delete cur.aiProfileSource;
@@ -271,13 +275,18 @@ describe('H10 — v4 → v5 migration (UTILITY-AI-DEEP-DIVE §7.3/§8)', () => {
     expect(result.status).toBe('ok');
     if (result.status !== 'ok') return;
     const s = result.state;
-    expect(s.version).toBe(5);
+    expect(s.version).toBe(6);
     expect(s.coins).toBe(raw.coins);
     expect(s.ownedItems).toEqual(raw.ownedItems);
     expect(s.adoptedCount).toBe(raw.adoptedCount);
     expect(s.rotationIndex).toBe(raw.rotationIndex);
     expect(s.phase).toBe('celebration');
-    expect(s.pendingAdoption).toEqual(raw.pendingAdoption);
+    // v6 names WHICH resident the celebration belongs to; for a pre-v6
+    // save that is the (only) rescue — everything else stays identical.
+    expect(s.pendingAdoption).toEqual({
+      ...(raw.pendingAdoption as Record<string, unknown>),
+      residentInstanceId: s.residents[0].instanceId,
+    });
     expect(s.settings).toEqual(raw.settings);
     expect(s.album).toEqual(raw.album);
     const before = raw.current as Record<string, unknown>;
@@ -285,7 +294,7 @@ describe('H10 — v4 → v5 migration (UTILITY-AI-DEEP-DIVE §7.3/§8)', () => {
       'species', 'name', 'hearts', 'outfit', 'instanceId', 'traitId',
       'traitSeed', 'traitSource', 'favBonusCount', 'favBonusLastDate',
     ]) {
-      expect(s.current[k as keyof typeof s.current]).toEqual(before[k]);
+      expect(s.residents[0][k as keyof typeof s.residents[0]]).toEqual(before[k]);
     }
     expect(s.rngSeed).toBe(raw.rngSeed);
     expect(s.arrivalIndex).toBe(raw.arrivalIndex);
@@ -301,14 +310,14 @@ describe('H10 — v4 → v5 migration (UTILITY-AI-DEEP-DIVE §7.3/§8)', () => {
     if (result.status !== 'ok') return;
     const s = result.state;
     const expected = deriveAiProfile(s.rngSeed, s.arrivalIndex, 'shy');
-    expect(s.current.aiProfile).toEqual({
+    expect(s.residents[0].aiProfile).toEqual({
       weights: expected.weights,
       metabolism: expected.metabolism,
       aiSeed: aiSeedFor(s.rngSeed, s.arrivalIndex),
     });
-    expect(s.current.aiProfileSource).toBe('migration');
-    expect(s.current.needs).toEqual(expected.arrivalNeeds);
-    for (const v of Object.values(s.current.needs!)) {
+    expect(s.residents[0].aiProfileSource).toBe('migration');
+    expect(s.residents[0].needs).toEqual(expected.arrivalNeeds);
+    for (const v of Object.values(s.residents[0].needs!)) {
       expect(v).toBeGreaterThanOrEqual(55);
       expect(v).toBeLessThanOrEqual(90);
     }
@@ -326,6 +335,94 @@ describe('H10 — v4 → v5 migration (UTILITY-AI-DEEP-DIVE §7.3/§8)', () => {
 
   it('is a no-op the second time (stored profile is never re-derived)', () => {
     const once = migrateSave(v4Fixture(), makeDeps());
+    expect(once.status).toBe('ok');
+    if (once.status !== 'ok') return;
+    const twice = migrateSave(structuredClone(once.state), makeDeps());
+    expect(twice.status).toBe('ok');
+    if (twice.status === 'ok') expect(twice.state).toEqual(once.state);
+  });
+});
+
+describe('H10 — v5 → v6 migration (multi-resident yard; step 2B)', () => {
+  // A faithful v5 save, modelled on a real mid-game one: the current
+  // migration output folded back to the v5 shape — mid-hearts rescue with
+  // needs + aiProfile, one album entry, coins, outfits owned, the SND-1
+  // audio prefs, and a frozen mid-choice adoption (which in v5 did NOT
+  // name its resident yet).
+  function v5Fixture() {
+    const v6 = migratedV1();
+    const raw = structuredClone(v6) as unknown as Record<string, unknown>;
+    raw.version = 5;
+    raw.settings = { audio: { muted: true, volume: 0.5, ambience: false } };
+    raw.phase = 'celebration';
+    raw.pendingAdoption = {
+      animalSnapshot: {
+        name: 'Clover',
+        species: 'bunny',
+        traitId: 'shy',
+        favoriteCareAction: 'feed',
+        outfit: 'bow',
+      },
+      offerIds: ['finn', 'marco', 'luna'],
+      pickId: 'finn',
+    };
+    const cur = (raw.residents as Record<string, unknown>[])[0];
+    raw.current = cur;
+    delete raw.residents;
+    return raw;
+  }
+
+  it('residents[0] IS the v5 current rescue — every field value-identical', () => {
+    const raw = v5Fixture();
+    const before = raw.current as Record<string, unknown>;
+    const result = migrateSave(structuredClone(raw), makeDeps());
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    const s = result.state;
+    expect(s.version).toBe(6);
+    expect(s.residents).toHaveLength(1);
+    // needs and aiProfile included: the stored AI life is carried, never
+    // re-derived, exactly like every other field.
+    expect(s.residents[0]).toEqual(before);
+    // Root fields carried exactly.
+    expect(s.coins).toBe(raw.coins);
+    expect(s.ownedItems).toEqual(raw.ownedItems);
+    expect(s.adoptedCount).toBe(raw.adoptedCount);
+    expect(s.rotationIndex).toBe(raw.rotationIndex);
+    expect(s.arrivalIndex).toBe(raw.arrivalIndex);
+    expect(s.rngSeed).toBe(raw.rngSeed);
+    expect(s.phase).toBe('celebration');
+    expect(s.settings).toEqual(raw.settings);
+    expect(s.album).toEqual(raw.album);
+    expect(s.adopterCooldowns).toEqual(raw.adopterCooldowns);
+    expect(s.lastOfferIds).toEqual(raw.lastOfferIds);
+    expect(s.lastStoryTemplateIds).toEqual(raw.lastStoryTemplateIds);
+    expect(s.lastSeenAt).toEqual(raw.lastSeenAt);
+  });
+
+  it('names the pending adoption’s resident — the v5 current rescue', () => {
+    const result = migrateSave(v5Fixture(), makeDeps());
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    const before = v5Fixture().pendingAdoption as Record<string, unknown>;
+    expect(result.state.pendingAdoption).toEqual({
+      ...before,
+      residentInstanceId: result.state.residents[0].instanceId,
+    });
+  });
+
+  it('gives album entries NO needs and NO aiProfile (§7.3)', () => {
+    const result = migrateSave(v5Fixture(), makeDeps());
+    expect(result.status).toBe('ok');
+    if (result.status !== 'ok') return;
+    for (const entry of result.state.album) {
+      expect(entry).not.toHaveProperty('needs');
+      expect(entry).not.toHaveProperty('aiProfile');
+    }
+  });
+
+  it('is a no-op the second time', () => {
+    const once = migrateSave(v5Fixture(), makeDeps());
     expect(once.status).toBe('ok');
     if (once.status !== 'ok') return;
     const twice = migrateSave(structuredClone(once.state), makeDeps());

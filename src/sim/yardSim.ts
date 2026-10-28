@@ -32,13 +32,23 @@ import {
 // The yard sim (UTILITY-AI-DEEP-DIVE §7): a pure state module on a fixed
 // 10 Hz timestep. The renderer subscribes via snapshot(); the DOM UI
 // dispatches intents (applyCare). No Math.random, no wall clock anywhere
-// below — all randomness flows from the per-instance yard stream, so the
+// below — all randomness flows from per-instance yard streams, so the
 // same save + same intent script produces a byte-identical event log (H1).
+//
+// STEP 2B: the sim hosts the whole yard at once. `YardSim` is the host —
+// one clock, one shared reservation table, one shared set of yard-wide
+// cooldowns (the treat jar's refill is a fact about the YARD, not about
+// any one animal). Each resident keeps its own brain, needs, position and
+// seeded stream inside a ResidentSim; residents step in insertion order
+// every tick, so decisions serialize and congestion is real (H8): a
+// resident deciding later in the same tick already sees the reservation
+// an earlier resident just made.
 
 export type SimMode = 'idle' | 'travel' | 'acting' | 'withPlayer';
 
 export interface SimEvent {
   t: number;
+  instanceId: string;
   type:
     | 'decide'
     | 'actionStarted'
@@ -73,7 +83,7 @@ interface ActiveAction {
   locked: boolean;
 }
 
-export interface YardSimOptions {
+export interface YardSimResidentOptions {
   instanceId: string;
   traitId: TraitId | null;
   weights: Needs;
@@ -84,6 +94,10 @@ export interface YardSimOptions {
   startPos?: { x: number; y: number };
 }
 
+export interface YardSimOptions {
+  residents: YardSimResidentOptions[];
+}
+
 export interface SimSnapshot {
   instanceId: string;
   time: number;
@@ -91,7 +105,12 @@ export interface SimSnapshot {
   x: number;
   y: number;
   needs: Needs;
-  action: { defId: string; category: Category; phase: 'travel' | 'acting' } | null;
+  action: {
+    defId: string;
+    instanceKey: string;
+    category: Category;
+    phase: 'travel' | 'acting';
+  } | null;
   thought: NeedId | null;
   topScores: { id: string; score: number }[];
   decisionCount: number;
@@ -99,42 +118,52 @@ export interface SimSnapshot {
 
 const EPS = 1e-9;
 const TICK = 1 / TUNING.tickHz;
+const EVENT_LOG_CAP = 2400;
 
-export class YardSim {
+/** State the host shares with every resident brain: the clock, the event
+ * sink, the reservation table and the yard-wide cooldowns. Reservations
+ * and cooldowns are facts about the yard; each resident's ScoreEnv reads
+ * them whole (the brain ignores a resident's own entries). */
+interface SharedYard {
+  clock: { t: number };
+  pushEvent: (instanceId: string, e: Omit<SimEvent, 't' | 'instanceId'>) => void;
+  reservations: { instanceKey: string; by: string }[];
+  globalCooldownUntil: Record<string, number>;
+  actingUsers: () => { instanceKey: string; by: string }[];
+}
+
+class ResidentSim {
   readonly instanceId: string;
   readonly traitId: TraitId | null;
-  readonly events: SimEvent[] = [];
 
+  private readonly shared: SharedYard;
   private readonly weights: Needs;
   private readonly metabolism: number;
   private readonly rng: () => number;
   private needs: Needs;
   private x: number;
   private y: number;
-  private tickCount = 0;
-  private accumulator = 0;
   private mode: SimMode = 'idle';
   private action: ActiveAction | null = null;
   private cooldownUntil: Partial<Record<Category, number>> = {};
-  private globalCooldownUntil: Record<string, number> = {};
   private postCare: { category: Category; until: number } | null = null;
   private withPlayerUntil = 0;
-  private reservations: { instanceKey: string; by: string }[] = [];
   private nextDecisionAt: number;
   private decisionCount = 0;
   private lastTop: { id: string; score: number }[] = [];
   private bands: Record<NeedId, number>;
 
-  constructor(opts: YardSimOptions) {
+  constructor(opts: YardSimResidentOptions, shared: SharedYard) {
     this.instanceId = opts.instanceId;
     this.traitId = opts.traitId;
+    this.shared = shared;
     this.weights = { ...opts.weights };
     this.metabolism = opts.metabolism;
     this.needs = clampNeeds({ ...opts.needs });
     this.x = opts.startPos?.x ?? HOME_SPOT.x;
     this.y = opts.startPos?.y ?? HOME_SPOT.y;
-    // One yard stream seeded from rngSeed (§7.2), distinct from both the
-    // trait stream and the AI-profile stream.
+    // One yard stream per resident, seeded from rngSeed (§7.2), distinct
+    // from both the trait stream and the AI-profile stream.
     this.rng = mulberry32(fnv1a(`sanctuary-yard:${opts.rngSeed}:${opts.arrivalIndex}`));
     // Decision staggering (§3.5): spread thinkers across the interval.
     this.nextDecisionAt =
@@ -142,8 +171,8 @@ export class YardSim {
     this.bands = this.currentBands();
   }
 
-  get time(): number {
-    return this.tickCount * TICK;
+  private get time(): number {
+    return this.shared.clock.t;
   }
 
   get currentMode(): SimMode {
@@ -152,6 +181,14 @@ export class YardSim {
 
   getNeeds(): Needs {
     return { ...this.needs };
+  }
+
+  /** The advertiser slot this resident is using (acting phase only) —
+   * the host folds these into the shared actingUsers view. */
+  actingUse(): { instanceKey: string; by: string } | null {
+    return this.action && this.action.phase === 'acting'
+      ? { instanceKey: this.action.instanceKey, by: this.instanceId }
+      : null;
   }
 
   snapshot(): SimSnapshot {
@@ -165,6 +202,7 @@ export class YardSim {
       action: this.action
         ? {
             defId: this.action.def.id,
+            instanceKey: this.action.instanceKey,
             category: this.action.def.category,
             phase: this.action.phase,
           }
@@ -173,25 +211,6 @@ export class YardSim {
       topScores: this.lastTop.map((s) => ({ ...s })),
       decisionCount: this.decisionCount,
     };
-  }
-
-  /**
-   * Advance by dt real seconds, in fixed 0.1 sim-second ticks. At most 5
-   * ticks per call (§7.2: a cozy game slows down rather than spiralling) —
-   * callers that want to fast-forward (the harness, probes) call step in a
-   * loop.
-   */
-  step(dt: number): void {
-    if (!(dt > 0)) return;
-    this.accumulator += dt;
-    let n = 0;
-    while (this.accumulator >= TICK - EPS && n < 5) {
-      this.accumulator -= TICK;
-      this.tickCount++;
-      this.tick();
-      n++;
-    }
-    if (n === 5) this.accumulator = 0; // drop the excess, never spiral
   }
 
   /**
@@ -219,9 +238,8 @@ export class YardSim {
 
   // ------------------------------ internals ------------------------------
 
-  private pushEvent(e: Omit<SimEvent, 't'>): void {
-    this.events.push({ t: Math.round(this.time * 10) / 10, ...e });
-    if (this.events.length > 600) this.events.splice(0, this.events.length - 600);
+  private pushEvent(e: Omit<SimEvent, 't' | 'instanceId'>): void {
+    this.shared.pushEvent(this.instanceId, e);
   }
 
   private currentBands(): Record<NeedId, number> {
@@ -253,12 +271,9 @@ export class YardSim {
       currentInstanceKey: this.action?.instanceKey ?? null,
       cooldownUntil: this.cooldownUntil,
       postCare: this.postCare,
-      reservations: this.reservations,
-      actingUsers:
-        this.action && this.action.phase === 'acting'
-          ? [{ instanceKey: this.action.instanceKey, by: this.instanceId }]
-          : [],
-      globalCooldownUntil: this.globalCooldownUntil,
+      reservations: this.shared.reservations,
+      actingUsers: this.shared.actingUsers(),
+      globalCooldownUntil: this.shared.globalCooldownUntil,
     };
     const scored = scoreAdvertisers(this.resident(), this.instances(), env);
     this.lastTop = scored
@@ -269,7 +284,8 @@ export class YardSim {
     return scored;
   }
 
-  private tick(): void {
+  /** One fixed tick of this resident's life, on the host's clock. */
+  tick(): void {
     const t = this.time;
     this.integrateDecay();
     this.progressAction();
@@ -349,7 +365,8 @@ export class YardSim {
     this.pushEvent({ type: 'actionCompleted', defId: a.def.id, category: a.def.category });
     this.cooldownUntil[a.def.category] = this.time + TUNING.categoryCooldownSec;
     if (a.def.globalCooldownSec) {
-      this.globalCooldownUntil[a.def.id] = this.time + a.def.globalCooldownSec;
+      // Yard-wide (§5.1): the treat jar refills for everyone at once.
+      this.shared.globalCooldownUntil[a.def.id] = this.time + a.def.globalCooldownSec;
     }
     this.releaseReservation(a.instanceKey);
     this.action = null;
@@ -372,9 +389,12 @@ export class YardSim {
   }
 
   private releaseReservation(instanceKey: string): void {
-    this.reservations = this.reservations.filter(
-      (r) => !(r.instanceKey === instanceKey && r.by === this.instanceId),
-    );
+    const shared = this.shared.reservations;
+    for (let i = shared.length - 1; i >= 0; i--) {
+      if (shared[i].instanceKey === instanceKey && shared[i].by === this.instanceId) {
+        shared.splice(i, 1);
+      }
+    }
   }
 
   private decide(): void {
@@ -474,7 +494,7 @@ export class YardSim {
       locked: false,
     };
     if (def.source !== 'fallback') {
-      this.reservations.push({ instanceKey: instance.key, by: this.instanceId });
+      this.shared.reservations.push({ instanceKey: instance.key, by: this.instanceId });
     }
     this.mode = 'travel';
     this.pushEvent({ type: 'actionStarted', defId: def.id, category: def.category });
@@ -486,5 +506,125 @@ export class YardSim {
       this.action.endsAt = this.time + def.durationSec;
       this.pushEvent({ type: 'actionArrived', defId: def.id, category: def.category });
     }
+  }
+}
+
+/**
+ * The yard host: every resident at once, on one clock. Owns the fixed
+ * timestep, the shared reservation table, the yard-wide cooldowns and
+ * the merged event log. Residents step in insertion order each tick, so
+ * the whole yard is deterministic for a given roster + intent script.
+ */
+export class YardSim {
+  readonly events: SimEvent[] = [];
+
+  private readonly residents: ResidentSim[] = [];
+  private readonly byId = new Map<string, ResidentSim>();
+  private readonly shared: SharedYard;
+  private tickCount = 0;
+  private accumulator = 0;
+
+  constructor(opts: YardSimOptions) {
+    const clock = { t: 0 };
+    this.shared = {
+      clock,
+      pushEvent: (instanceId, e) => {
+        this.events.push({
+          t: Math.round(clock.t * 10) / 10,
+          instanceId,
+          ...e,
+        });
+        if (this.events.length > EVENT_LOG_CAP) {
+          this.events.splice(0, this.events.length - EVENT_LOG_CAP);
+        }
+      },
+      reservations: [],
+      globalCooldownUntil: {},
+      actingUsers: () => {
+        const out: { instanceKey: string; by: string }[] = [];
+        for (const r of this.residents) {
+          const use = r.actingUse();
+          if (use) out.push(use);
+        }
+        return out;
+      },
+    };
+    for (const r of opts.residents) this.addResident(r);
+  }
+
+  get time(): number {
+    return this.tickCount * TICK;
+  }
+
+  residentIds(): string[] {
+    return this.residents.map((r) => r.instanceId);
+  }
+
+  hasResident(instanceId: string): boolean {
+    return this.byId.has(instanceId);
+  }
+
+  addResident(opts: YardSimResidentOptions): void {
+    if (this.byId.has(opts.instanceId)) return;
+    const sim = new ResidentSim(opts, this.shared);
+    this.residents.push(sim);
+    this.byId.set(opts.instanceId, sim);
+  }
+
+  removeResident(instanceId: string): void {
+    const sim = this.byId.get(instanceId);
+    if (!sim) return;
+    // Its reservations die with it — the slot frees for everyone else.
+    const shared = this.shared.reservations;
+    for (let i = shared.length - 1; i >= 0; i--) {
+      if (shared[i].by === instanceId) shared.splice(i, 1);
+    }
+    this.byId.delete(instanceId);
+    const idx = this.residents.indexOf(sim);
+    if (idx >= 0) this.residents.splice(idx, 1);
+  }
+
+  /**
+   * Advance by dt real seconds, in fixed 0.1 sim-second ticks. At most 5
+   * ticks per call (§7.2: a cozy game slows down rather than spiralling) —
+   * callers that want to fast-forward (the harness, probes) call step in
+   * a loop.
+   */
+  step(dt: number): void {
+    if (!(dt > 0)) return;
+    this.accumulator += dt;
+    let n = 0;
+    while (this.accumulator >= TICK - EPS && n < 5) {
+      this.accumulator -= TICK;
+      this.tickCount++;
+      this.shared.clock.t = this.tickCount * TICK;
+      // Snapshot the list: a tick never adds/removes residents (only the
+      // game layer does, between frames), but iterate a copy for safety.
+      for (const r of [...this.residents]) r.tick();
+      n++;
+    }
+    if (n === 5) this.accumulator = 0; // drop the excess, never spiral
+  }
+
+  /** A player care intent for ONE resident (§3.5). */
+  applyCare(instanceId: string, care: CareIntentId): void {
+    this.byId.get(instanceId)?.applyCare(care);
+  }
+
+  getNeeds(instanceId: string): Needs {
+    const sim = this.byId.get(instanceId);
+    return sim ? sim.getNeeds() : clampNeeds({ tummy: 0, energy: 0, clean: 0, fun: 0, affection: 0 });
+  }
+
+  /** One resident's snapshot — or, with no argument, the first resident's
+   * (the shape the step-1 probes were written against). */
+  snapshot(instanceId?: string): SimSnapshot {
+    const sim = instanceId ? this.byId.get(instanceId) : this.residents[0];
+    if (!sim) throw new Error('YardSim.snapshot: no such resident');
+    return sim.snapshot();
+  }
+
+  snapshots(): SimSnapshot[] {
+    return this.residents.map((r) => r.snapshot());
   }
 }

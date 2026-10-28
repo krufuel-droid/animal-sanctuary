@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CURRENT_SAVE_VERSION,
+  MAX_RESIDENTS,
   type AlbumEntry,
   type GameState,
   type Rescue,
@@ -14,7 +15,7 @@ import { TRAITS, rollTrait } from './game/traits';
 import { ROSTER_ORDER, SPECIES } from './game/roster';
 import { OUTFITS, AnimalSvg, type OutfitId, type SleepState } from './game/animals';
 import { YardProp } from './game/props';
-import { YardSim, type SimSnapshot } from './sim/yardSim';
+import { YardSim, type SimSnapshot, type YardSimResidentOptions } from './sim/yardSim';
 import { deriveAiProfile } from './sim/traits-ai';
 import { absenceCatchUp, NEED_ICONS, type Needs } from './sim/needs';
 import { YARD_LAYOUT } from './sim/advertisers';
@@ -42,11 +43,21 @@ import {
 
 // Animal Sanctuary — repo build (Phase 1). Game rules are Phase 0's, exactly:
 // 2 coins per care tap, +30 per adoption, 8 hearts, shop 10/15/20/25/30,
-// visits are affection-only. Saves are one whole v4 document in localStorage
+// visits are affection-only. Saves are one whole document in localStorage
 // (src/save), migrated client-side before the first write, and a save that
 // cannot be read is reported — never overwritten.
+//
+// Phase 2 step 2B: the yard holds up to MAX_RESIDENTS rescues at once, each
+// with its own hearts, needs and autonomy (Amanda's ruling: "Each rescue
+// has its own hearts — adopted one leaves, a new rescue arrives"). The
+// bottom panel cares for the SELECTED resident (tap a walker to select);
+// a celebration belongs to the one resident named in pendingAdoption.
 
 const STORAGE: Storage = window.localStorage;
+
+/** The cheerful pause between arrival fills (step 2B): one rescue at a
+ * time trots in, never several in a single frame. */
+const ARRIVAL_PAUSE_MS = 1600;
 
 function todayLocal(): string {
   const d = new Date();
@@ -90,7 +101,7 @@ function freshState(seed: number = newMasterSeed()): GameState {
     adoptedCount: 0,
     rotationIndex: 0,
     phase: 'caring',
-    current: makeRescue(0, seed, 1, null),
+    residents: [makeRescue(0, seed, 1, null)],
     album: [],
     rngSeed: seed,
     arrivalIndex: 1,
@@ -102,19 +113,52 @@ function freshState(seed: number = newMasterSeed()): GameState {
   };
 }
 
+/** A resident's own arrival number (its AI/yard streams key on it):
+ * game-minted residents are `arr-<n>`; anything else falls back to the
+ * root counter (the primary resident of an older save). */
+function arrivalIndexOf(instanceId: string, fallback: number): number {
+  const m = /^arr-(\d+)$/.exec(instanceId);
+  return m ? Number(m[1]) : fallback;
+}
+
+/** Sim construction options for one resident, from its stored record.
+ * The stored aiProfile/needs always win; derivation is only the
+ * defensive fallback for a record migration somehow left bare. */
+function simOptsFor(state: GameState, r: Rescue): YardSimResidentOptions {
+  const traitId = (r.traitId as TraitId | null) ?? null;
+  const arrivalIndex = arrivalIndexOf(r.instanceId, state.arrivalIndex);
+  const derived = deriveAiProfile(state.rngSeed, arrivalIndex, traitId ?? 'gentle');
+  return {
+    instanceId: r.instanceId,
+    traitId,
+    weights: r.aiProfile?.weights ?? derived.weights,
+    metabolism: r.aiProfile?.metabolism ?? derived.metabolism,
+    needs: r.needs ?? derived.arrivalNeeds,
+    rngSeed: state.rngSeed,
+    arrivalIndex,
+  };
+}
+
 /** Apply the §1.3 absence catch-up to a freshly loaded/imported state:
  * needs ease toward "ready for company" — never below the floor of 35,
- * never a punishment. Pre-v5 saves (no lastSeenAt) skip it entirely. */
+ * never a punishment. Pre-v5 saves (no lastSeenAt) skip it entirely.
+ * Step 2B: every resident gets its own catch-up. */
 function withLoadCatchUp(state: GameState): GameState {
-  if (!state.current.needs || typeof state.lastSeenAt !== 'number') return state;
+  if (typeof state.lastSeenAt !== 'number') return state;
   const elapsed = (Date.now() - state.lastSeenAt) / 1000;
   if (!(elapsed > 0)) return state;
-  const adjusted = absenceCatchUp(state.current.needs, elapsed);
-  const changed = (Object.keys(adjusted) as (keyof Needs)[]).some(
-    (k) => Math.abs(adjusted[k] - state.current.needs![k]) > 0.001,
-  );
-  if (!changed) return state;
-  return { ...state, current: { ...state.current, needs: adjusted } };
+  let changed = false;
+  const residents = state.residents.map((r) => {
+    if (!r.needs) return r;
+    const adjusted = absenceCatchUp(r.needs, elapsed);
+    const drifted = (Object.keys(adjusted) as (keyof Needs)[]).some(
+      (k) => Math.abs(adjusted[k] - r.needs![k]) > 0.001,
+    );
+    if (!drifted) return r;
+    changed = true;
+    return { ...r, needs: adjusted };
+  });
+  return changed ? { ...state, residents } : state;
 }
 
 /** Debug readout (UTILITY-AI-DEEP-DIVE §8 D-checks): ?debug=1 shows the
@@ -139,6 +183,19 @@ function simViewChanged(a: SimSnapshot | null, b: SimSnapshot): boolean {
   );
 }
 
+/** Sleep pose from a resident's sim state (§5.2 — a pose per category):
+ * a real bed is a full sleep; any other rest advertiser (cushion pile,
+ * sunny spot, shade tree) or the cuddle rug is a doze. */
+function sleepOf(snap: SimSnapshot | null | undefined): SleepState | undefined {
+  if (!snap) return undefined;
+  return snap.mode === 'acting' && snap.action?.defId === 'bed'
+    ? 'asleep'
+    : snap.mode === 'acting' &&
+        (snap.action?.category === 'rest' || snap.action?.defId === 'cuddle-rug')
+      ? 'sleepy'
+      : 'awake';
+}
+
 type View = { kind: 'sanctuary' } | { kind: 'album' } | { kind: 'visit'; entryId: string };
 
 export default function App() {
@@ -150,58 +207,61 @@ export default function App() {
   const [importMsg, setImportMsg] = useState<string | null>(null);
   const [audioPrefs, setAudioPrefs] = useState<AudioPrefs>({ ...DEFAULT_AUDIO_PREFS });
   const [soundPop, setSoundPop] = useState(false);
+  /** Which resident the bottom panel cares for. Runtime state only —
+   * never saved; null means "the first resident". */
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const prevPhase = useRef<string | null>(null);
-  const stageRef = useRef<StageHandle | null>(null);
+  const stageRefs = useRef(new Map<string, StageHandle>());
   const visitStageRef = useRef<StageHandle | null>(null);
   const celebrationRef = useRef<HTMLDivElement | null>(null);
-  const favLineIdx = useRef(0);
+  const favLineIdx = useRef<Record<string, number>>({});
   const otherLineUsedFor = useRef<string | null>(null);
   const saveTimer = useRef<number | undefined>(undefined);
   const gameRef = useRef<GameState | null>(null);
   gameRef.current = game;
 
-  /* ---------- Phase 2: the yard sim (one resident, step 1) ----------
-   * The sim is runtime state, rebuilt per resident from the save's stored
-   * needs + aiProfile. It owns needs while it lives; commits copy its
-   * needs back into the document (see commit/syncFromSim). */
+  /* ---------- Phase 2: the yard sim (all residents, step 2B) ----------
+   * The sim is runtime state, reconciled against the save's residents:
+   * it owns needs while it lives; commits copy its needs back into the
+   * document (see commit/syncFromSim). */
   const simRef = useRef<YardSim | null>(null);
-  const simForRef = useRef<string | null>(null);
-  const [simView, setSimView] = useState<SimSnapshot | null>(null);
+  const [simViews, setSimViews] = useState<Record<string, SimSnapshot>>({});
   const [simEpoch, setSimEpoch] = useState(0);
   const commitRef = useRef<(next: GameState) => void>(() => {});
 
-  const ensureSim = useCallback((state: GameState): YardSim => {
-    const cur = state.current;
-    if (simRef.current && simForRef.current === cur.instanceId) {
-      return simRef.current;
+  const ensureSims = useCallback((state: GameState): YardSim => {
+    let host = simRef.current;
+    if (!host) {
+      host = new YardSim({
+        residents: state.residents.map((r) => simOptsFor(state, r)),
+      });
+      simRef.current = host;
+      return host;
     }
-    const traitId = (cur.traitId as TraitId | null) ?? null;
-    const derived = deriveAiProfile(
-      state.rngSeed,
-      state.arrivalIndex,
-      traitId ?? 'gentle',
-    );
-    const sim = new YardSim({
-      instanceId: cur.instanceId,
-      traitId,
-      weights: cur.aiProfile?.weights ?? derived.weights,
-      metabolism: cur.aiProfile?.metabolism ?? derived.metabolism,
-      needs: cur.needs ?? derived.arrivalNeeds,
-      rngSeed: state.rngSeed,
-      arrivalIndex: state.arrivalIndex,
-    });
-    simRef.current = sim;
-    simForRef.current = cur.instanceId;
-    return sim;
+    for (const r of state.residents) {
+      if (!host.hasResident(r.instanceId)) host.addResident(simOptsFor(state, r));
+    }
+    for (const id of host.residentIds()) {
+      if (!state.residents.some((r) => r.instanceId === id)) {
+        host.removeResident(id);
+      }
+    }
+    return host;
   }, []);
 
-  /** Copy the sim's live needs into a state about to be saved — but only
-   * when the sim belongs to that state's resident (a Fresh Start or a new
-   * arrival must never inherit the old resident's needs). */
+  /** Copy the sim's live needs into a state about to be saved, resident
+   * by resident. A resident the sim doesn't know (a brand-new arrival
+   * in the same commit) keeps its stored needs. */
   const syncFromSim = useCallback((state: GameState): GameState => {
     const sim = simRef.current;
-    if (!sim || simForRef.current !== state.current.instanceId) return state;
-    return { ...state, current: { ...state.current, needs: sim.getNeeds() } };
+    if (!sim) return state;
+    let changed = false;
+    const residents = state.residents.map((r) => {
+      if (!sim.hasResident(r.instanceId)) return r;
+      changed = true;
+      return { ...r, needs: sim.getNeeds(r.instanceId) };
+    });
+    return changed ? { ...state, residents } : state;
   }, []);
 
   /* ---------- load once: migrate in memory BEFORE any write (F1 fencing) */
@@ -287,7 +347,7 @@ export default function App() {
       window.removeEventListener('pagehide', flush);
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, []);
+  }, [syncFromSim]);
 
   /* ---------- sound: unlock on every pointerdown (capture); the engine
      latches, sets the iOS audio session on the first tap, and stays silent
@@ -311,12 +371,15 @@ export default function App() {
      never on a reload that lands mid-celebration */
   useEffect(() => {
     const phase = game?.phase ?? null;
-    if (prevPhase.current === 'caring' && phase === 'celebration' && game?.current) {
-      Snd.play('celebrate.adoption', { species: game.current.species, delay: 0.35 });
+    if (prevPhase.current === 'caring' && phase === 'celebration' && game?.pendingAdoption) {
+      Snd.play('celebrate.adoption', {
+        species: game.pendingAdoption.animalSnapshot.species,
+        delay: 0.35,
+      });
       Snd.duck('amb', -8);
     }
     if (phase !== null) prevPhase.current = phase;
-  }, [game?.phase, game?.current]);
+  }, [game?.phase, game?.pendingAdoption]);
 
   /* bring the celebration into view when the phase flips (audit F3/C3) */
   useEffect(() => {
@@ -330,11 +393,23 @@ export default function App() {
      (only when something visible changed), and sync needs into the save
      on the autosave cadence. Sim time is real elapsed time at 1× — a
      hidden tab simply stops stepping (no catch-up burst, §7.2). */
-  const currentInstanceId = game?.current.instanceId;
+  const residentKey = game?.residents.map((r) => r.instanceId).join(',') ?? '';
   useEffect(() => {
-    if (view.kind !== 'sanctuary' || !gameRef.current || !currentInstanceId) return;
-    const sim = ensureSim(gameRef.current);
-    setSimView(sim.snapshot());
+    if (view.kind !== 'sanctuary' || !gameRef.current || !residentKey) return;
+    const sim = ensureSims(gameRef.current);
+    const publish = () => {
+      const snaps = sim.snapshots();
+      setSimViews((prev) => {
+        let changed = Object.keys(prev).length !== snaps.length;
+        const next: Record<string, SimSnapshot> = {};
+        for (const s of snaps) {
+          next[s.instanceId] = s;
+          if (simViewChanged(prev[s.instanceId] ?? null, s)) changed = true;
+        }
+        return changed ? next : prev;
+      });
+    };
+    publish();
     // Date.now (not performance.now): the probes drive the yard with
     // Playwright's mocked clock, which fakes Date/timers but not
     // performance.now — an elapsed pump on performance.now would crawl
@@ -347,25 +422,71 @@ export default function App() {
       const dt = Math.min(0.5, Math.max(0, (now - last) / 1000));
       last = now;
       if (dt > 0) sim.step(dt);
-      const snap = sim.snapshot();
-      setSimView((prev) => (simViewChanged(prev, snap) ? snap : prev));
+      publish();
       if (now - lastSync > 5000) {
         lastSync = now;
         const g = gameRef.current;
-        if (g && g.current.instanceId === sim.instanceId) {
-          const saved = g.current.needs;
-          const drifted =
-            !saved ||
-            (Object.keys(snap.needs) as (keyof Needs)[]).some(
-              (k) => Math.abs(snap.needs[k] - saved[k]) > 0.5,
+        if (g) {
+          const drifted = g.residents.some((r) => {
+            if (!sim.hasResident(r.instanceId)) return false;
+            const live = sim.getNeeds(r.instanceId);
+            const saved = r.needs;
+            return (
+              !saved ||
+              (Object.keys(live) as (keyof Needs)[]).some(
+                (k) => Math.abs(live[k] - saved[k]) > 0.5,
+              )
             );
+          });
           if (drifted) commitRef.current({ ...g });
         }
       }
     }, 100);
     return () => window.clearInterval(iv);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view.kind, currentInstanceId, simEpoch, ensureSim]);
+  }, [view.kind, residentKey, simEpoch, ensureSims]);
+
+  /* ---------- arrivals (step 2B): open spots refill, one at a time,
+     while the yard is in its caring rhythm — never mid-celebration.
+     Runs on load (a migrated yard grows to the cap), after Fresh Start,
+     and after each adoption, once the player is back in the yard. */
+  const arriveNext = useCallback((g: GameState) => {
+    const nextIdx = (g.rotationIndex + 1) % ROSTER_ORDER.length;
+    const arrivalIndex = g.arrivalIndex + 1;
+    const previous = g.residents[g.residents.length - 1];
+    const rescue = makeRescue(
+      nextIdx,
+      g.rngSeed,
+      arrivalIndex,
+      (previous?.traitId as TraitId | null) ?? null,
+    );
+    Snd.play('arrive', { species: rescue.species, delay: 0.05 });
+    commitRef.current({
+      ...g,
+      rotationIndex: nextIdx,
+      arrivalIndex,
+      residents: [...g.residents, rescue],
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!game || view.kind !== 'sanctuary') return;
+    if (game.phase !== 'caring' || game.pendingAdoption) return;
+    if (game.residents.length >= MAX_RESIDENTS) return;
+    const t = window.setTimeout(() => {
+      const g = gameRef.current;
+      if (
+        !g ||
+        g.phase !== 'caring' ||
+        g.pendingAdoption ||
+        g.residents.length >= MAX_RESIDENTS
+      ) {
+        return;
+      }
+      arriveNext(g);
+    }, ARRIVAL_PAUSE_MS);
+    return () => window.clearTimeout(t);
+  }, [game, view.kind, arriveNext]);
 
   /* debug handle for the §8 D-check probes */
   useEffect(() => {
@@ -373,107 +494,146 @@ export default function App() {
     const w = window as unknown as { __yard?: unknown };
     w.__yard = {
       sim: () => simRef.current,
-      snapshot: () => simRef.current?.snapshot() ?? null,
+      snapshot: (id?: string) => {
+        try {
+          return simRef.current?.snapshot(id) ?? null;
+        } catch {
+          return null;
+        }
+      },
+      snapshots: () => simRef.current?.snapshots() ?? [],
       step: (seconds: number) => simRef.current?.step(seconds),
       events: () => simRef.current?.events ?? [],
+      care: (id: string, a: CareActionId) => simRef.current?.applyCare(id, a),
     };
   }, []);
 
-  const current = game?.current;
-  const currentTrait =
-    current && current.traitId && current.traitId in TRAITS
-      ? TRAITS[current.traitId as TraitId]
+  /* ---------- derived: selection + the celebration's resident ---------- */
+  const residents = game?.residents ?? [];
+  const selected =
+    residents.find((r) => r.instanceId === selectedId) ?? residents[0];
+  const selectedTrait =
+    selected && selected.traitId && selected.traitId in TRAITS
+      ? TRAITS[selected.traitId as TraitId]
       : null;
   const bonusAvailable =
-    !!current &&
-    !!currentTrait &&
-    current.favBonusCount < 2 &&
-    current.favBonusLastDate !== todayLocal();
+    !!selected &&
+    !!selectedTrait &&
+    selected.favBonusCount < 2 &&
+    selected.favBonusLastDate !== todayLocal();
 
-  const profile: AnimalProfile | null = useMemo(() => {
-    if (!current || !currentTrait) return null;
+  const selectedProfile: AnimalProfile | null = useMemo(() => {
+    if (!selected || !selectedTrait) return null;
     return {
-      species: current.species as SpeciesId,
-      traitId: currentTrait.id,
-      favoriteCareAction: currentTrait.loves,
+      species: selected.species as SpeciesId,
+      traitId: selectedTrait.id,
+      favoriteCareAction: selectedTrait.loves,
     };
-  }, [current, currentTrait]);
+  }, [selected, selectedTrait]);
+
+  /* The celebration belongs to ONE resident — the one frozen into
+   * pendingAdoption — never to whoever happens to be selected. */
+  const pending = game?.pendingAdoption ?? null;
+  const pendingResident = pending
+    ? (residents.find((r) => r.instanceId === pending.residentInstanceId) ?? null)
+    : null;
+  const pendingProfile: AnimalProfile | null = useMemo(() => {
+    if (!pending) return null;
+    const traitId = (pending.animalSnapshot.traitId ??
+      pendingResident?.traitId ??
+      'gentle') as TraitId;
+    return {
+      species: pending.animalSnapshot.species as SpeciesId,
+      traitId,
+      favoriteCareAction: (pending.animalSnapshot.favoriteCareAction ??
+        TRAITS[traitId].loves) as CareActionId,
+    };
+  }, [pending, pendingResident]);
+
+  const replaceResident = (next: GameState, updated: Rescue): GameState => ({
+    ...next,
+    residents: next.residents.map((r) =>
+      r.instanceId === updated.instanceId ? updated : r,
+    ),
+  });
 
   /* ------------------------------ care (sanctuary) ------------------------------ */
   const handleCare = (action: CareActionId) => {
-    if (!game || !current || game.phase !== 'caring') return;
-    const stage = stageRef.current;
+    if (!game || !selected || game.phase !== 'caring') return;
+    const stage = stageRefs.current.get(selected.instanceId);
     stage?.react(action);
     stage?.wake();
 
-    // Phase 2: the tap is also a sim intent (§3.5) — autonomy yields,
-    // the need refill lands instantly with the hearts/coins below, and
-    // commit() syncs the sim's needs into the same document write.
-    if (simRef.current && simForRef.current === current.instanceId) {
-      simRef.current.applyCare(action);
-    }
+    // Phase 2: the tap is also a sim intent (§3.5) for THIS resident —
+    // its autonomy yields, the need refill lands instantly with the
+    // hearts/coins below, and commit() syncs the sim's needs into the
+    // same document write. Yard-mates are untouched.
+    simRef.current?.applyCare(selected.instanceId, action);
 
-    const isFav = !!currentTrait && currentTrait.loves === action;
+    const isFav = !!selectedTrait && selectedTrait.loves === action;
     const bonus = isFav && bonusAvailable;
     const heartsGain = bonus ? 2 : 1;
-    const newHearts = Math.min(8, current.hearts + heartsGain);
+    const newHearts = Math.min(8, selected.hearts + heartsGain);
 
-    // Speech (§B3.1): favourite → trait lines, alternating; a matching
-    // contrasting line at most once per rescue; otherwise the generic pool,
-    // picked the original way: (hearts + action length) % pool size.
+    // Speech (§B3.1): favourite → trait lines, alternating per resident;
+    // a matching contrasting line at most once per rescue; otherwise the
+    // generic pool, picked the original way: (hearts + action length) %
+    // pool size.
     let line: string;
-    if (isFav && currentTrait) {
-      line = currentTrait.favLines[favLineIdx.current % 2];
-      favLineIdx.current += 1;
+    if (isFav && selectedTrait) {
+      const idx = favLineIdx.current[selected.instanceId] ?? 0;
+      line = selectedTrait.favLines[idx % 2];
+      favLineIdx.current[selected.instanceId] = idx + 1;
     } else if (
-      currentTrait &&
-      currentTrait.otherLine.action === action &&
-      otherLineUsedFor.current !== current.instanceId
+      selectedTrait &&
+      selectedTrait.otherLine.action === action &&
+      otherLineUsedFor.current !== selected.instanceId
     ) {
-      line = currentTrait.otherLine.text;
-      otherLineUsedFor.current = current.instanceId;
+      line = selectedTrait.otherLine.text;
+      otherLineUsedFor.current = selected.instanceId;
     } else {
       const pool = GENERIC_LINES[action];
-      line = pool[(current.hearts + action.length) % pool.length];
+      line = pool[(selected.hearts + action.length) % pool.length];
     }
     stage?.say(line);
     stage?.floatEmojis(bonus ? ['❤️', '✨', '🪙'] : ['❤️', '🪙']);
 
     // Sound: the care action, the heart ladder for each heart just filled
     // (the bonus heart gets the octave shimmer), and the throttled coin tick.
-    Snd.play(`care.${action}`, { species: current.species, favourite: isFav });
+    Snd.play(`care.${action}`, { species: selected.species, favourite: isFav });
     for (let k = 0; k < heartsGain; k++) {
       Snd.play('heart.fill', {
-        noteIndex: current.hearts + k,
+        noteIndex: selected.hearts + k,
         favourite: bonus && k === heartsGain - 1,
         delay: 0.12 + k * 0.1,
       });
     }
     Snd.play('coin.earn');
 
-    const next: GameState = {
+    let next: GameState = {
       ...game,
       coins: game.coins + 2,
-      current: {
-        ...current,
-        hearts: newHearts,
-        favBonusCount: bonus ? current.favBonusCount + 1 : current.favBonusCount,
-        favBonusLastDate: bonus ? todayLocal() : current.favBonusLastDate,
-      },
     };
+    next = replaceResident(next, {
+      ...selected,
+      hearts: newHearts,
+      favBonusCount: bonus ? selected.favBonusCount + 1 : selected.favBonusCount,
+      favBonusLastDate: bonus ? todayLocal() : selected.favBonusLastDate,
+    });
 
-    if (newHearts >= 8 && profile) {
-      // Flow C, commit 1 (audit F7): freeze the offer, flip the phase.
-      // No album entry, no +30 yet.
-      const offer = generateOffer(profile, game.adopterCooldowns, game.lastOfferIds);
+    if (newHearts >= 8 && selectedProfile) {
+      // Flow C, commit 1 (audit F7): freeze the offer FOR THIS RESIDENT,
+      // flip the phase. No album entry, no +30 yet.
+      const offer = generateOffer(selectedProfile, game.adopterCooldowns, game.lastOfferIds);
       next.phase = 'celebration';
       next.pendingAdoption = {
+        residentInstanceId: selected.instanceId,
         animalSnapshot: {
-          name: current.name,
-          species: current.species,
-          traitId: current.traitId,
-          favoriteCareAction: profile.favoriteCareAction,
-          outfit: current.outfit,
+          name: selected.name,
+          species: selected.species,
+          traitId: selected.traitId,
+          favoriteCareAction: selectedProfile.favoriteCareAction,
+          outfit: selected.outfit,
         },
         offerIds: offer.offerIds,
         pickId: offer.pickId,
@@ -484,13 +644,12 @@ export default function App() {
 
   /* ------------------------------ adoption (card tap) ------------------------------ */
   const handleChooseAdopter = (adopterId: string) => {
-    if (!game || !current || !game.pendingAdoption || !profile) return;
-    const pending = game.pendingAdoption;
+    if (!game || !pending || !pendingProfile) return;
     const adopter = ADOPTERS_BY_ID[adopterId];
     if (!adopter) return;
     const trioScores: Record<string, number> = {};
     for (const id of pending.offerIds) {
-      trioScores[id] = scoreAdopter(profile, ADOPTERS_BY_ID[id]).total;
+      trioScores[id] = scoreAdopter(pendingProfile, ADOPTERS_BY_ID[id]).total;
     }
     const chosenScore = trioScores[adopterId] ?? 0;
     const badge = isPerfectMatch(adopterId, trioScores);
@@ -498,8 +657,8 @@ export default function App() {
       {
         name: pending.animalSnapshot.name,
         species: pending.animalSnapshot.species as SpeciesId,
-        traitId: (pending.animalSnapshot.traitId ?? 'gentle') as TraitId,
-        favoriteCareAction: profile.favoriteCareAction,
+        traitId: pendingProfile.traitId,
+        favoriteCareAction: pendingProfile.favoriteCareAction,
       },
       adopter,
       {
@@ -514,9 +673,9 @@ export default function App() {
       species: pending.animalSnapshot.species,
       outfit: pending.animalSnapshot.outfit,
       story: story.story,
-      instanceId: current.instanceId,
+      instanceId: pending.residentInstanceId,
       traitId: pending.animalSnapshot.traitId,
-      favoriteCareAction: profile.favoriteCareAction,
+      favoriteCareAction: pendingProfile.favoriteCareAction,
       adopterId: adopter.id,
       adopterName: adopter.name,
       adopterHome: adopter.home,
@@ -528,6 +687,27 @@ export default function App() {
     };
     Snd.play('coin.cascade', { delay: 0.05 });
     if (badge) Snd.play('celebrate.perfect', { delay: 0.2 });
+
+    // The adopted resident leaves the yard. If it was somehow the only
+    // one (a pre-v6 save loaded mid-celebration holds exactly one), the
+    // next rescue arrives in the same breath — the yard is never empty.
+    let nextResidents = game.residents.filter(
+      (r) => r.instanceId !== pending.residentInstanceId,
+    );
+    let { rotationIndex, arrivalIndex } = game;
+    if (nextResidents.length === 0) {
+      rotationIndex = (rotationIndex + 1) % ROSTER_ORDER.length;
+      arrivalIndex = arrivalIndex + 1;
+      nextResidents = [
+        makeRescue(
+          rotationIndex,
+          game.rngSeed,
+          arrivalIndex,
+          (pendingResident?.traitId as TraitId | null) ?? null,
+        ),
+      ];
+    }
+    if (selectedId === pending.residentInstanceId) setSelectedId(null);
     commit({
       ...game,
       coins: game.coins + 30,
@@ -537,28 +717,17 @@ export default function App() {
       adopterCooldowns: applyAdoptionCooldowns(game.adopterCooldowns, adopterId),
       lastOfferIds: pending.offerIds,
       lastStoryTemplateIds: story.templateIds,
+      residents: nextResidents,
+      rotationIndex,
+      arrivalIndex,
     });
   };
 
-  const handleNextRescue = () => {
+  /* Back from the post-adoption story to the yard's caring rhythm —
+   * the arrival machinery refills the open spot from here. */
+  const handleBackToYard = () => {
     if (!game || game.pendingAdoption) return;
-    const nextIdx = (game.rotationIndex + 1) % ROSTER_ORDER.length;
-    const arrivalIndex = game.arrivalIndex + 1;
-    const rescue = makeRescue(
-      nextIdx,
-      game.rngSeed,
-      arrivalIndex,
-      (current?.traitId as TraitId | null) ?? null,
-    );
-    favLineIdx.current = 0;
-    Snd.play('arrive', { species: rescue.species, delay: 0.05 });
-    commit({
-      ...game,
-      rotationIndex: nextIdx,
-      arrivalIndex,
-      phase: 'caring',
-      current: rescue,
-    });
+    commit({ ...game, phase: 'caring' });
   };
 
   /* ------------------------------ shop ------------------------------ */
@@ -573,14 +742,16 @@ export default function App() {
     commit({ ...game, coins: game.coins - price, ownedItems: [...game.ownedItems, outfitId] });
   };
   const handleWear = (outfitId: OutfitId) => {
-    if (!game || !current) return;
-    const equipping = current.outfit !== outfitId;
-    if (equipping) Snd.play('shop.equip', { species: current.species });
+    if (!game || !selected) return;
+    const equipping = selected.outfit !== outfitId;
+    if (equipping) Snd.play('shop.equip', { species: selected.species });
     else Snd.play('ui.tap');
-    commit({
-      ...game,
-      current: { ...current, outfit: current.outfit === outfitId ? null : outfitId },
-    });
+    commit(
+      replaceResident(game, {
+        ...selected,
+        outfit: selected.outfit === outfitId ? null : outfitId,
+      }),
+    );
   };
 
   /* ------------------------------ visit care: affection only ------------------------------ */
@@ -607,16 +778,21 @@ export default function App() {
   };
 
   /* ------------------------------ reset / import ------------------------------ */
+  const dropSim = () => {
+    // The old yard's sim must not leak into a replaced sanctuary (a
+    // fresh first rescue reuses instanceId 'arr-1'): drop it, and the
+    // selection with it, before committing.
+    simRef.current = null;
+    setSimViews({});
+    setSelectedId(null);
+    setSimEpoch((e) => e + 1);
+  };
+
   const handleFreshStart = () => {
     // Fresh Start does NOT reset audio prefs (§8.3) — they ride along.
     Snd.play('ui.close'); // a door closing gently — no dramatic sting (§1.3)
     const fresh: GameState = { ...freshState(), settings: { audio: Snd.getPrefs() } };
-    // The old resident's sim must not leak into the new sanctuary (its
-    // first rescue reuses instanceId 'arr-1'): drop it before committing.
-    simRef.current = null;
-    simForRef.current = null;
-    setSimView(null);
-    setSimEpoch((e) => e + 1);
+    dropSim();
     setView({ kind: 'sanctuary' });
     setConfirmReset(false);
     setLoadIssue(null);
@@ -638,10 +814,7 @@ export default function App() {
       setAudioPrefs(prefs);
       Snd.loadPrefs(prefs, result.state.rngSeed);
       // Same rule as Fresh Start: the replaced sanctuary gets a fresh sim.
-      simRef.current = null;
-      simForRef.current = null;
-      setSimView(null);
-      setSimEpoch((e) => e + 1);
+      dropSim();
       const caught = withLoadCatchUp(result.state);
       commit(caught);
       try {
@@ -701,7 +874,7 @@ export default function App() {
     );
   }
 
-  if (!game || !current) {
+  if (!game || !selected) {
     return (
       <Shell>
         <p className="text-center text-lg font-semibold py-16">Opening the sanctuary… 🐾</p>
@@ -712,23 +885,8 @@ export default function App() {
   const lastAdopted = game.album[game.album.length - 1] as AlbumEntry | undefined;
   const visitEntry =
     view.kind === 'visit' ? game.album.find((e) => e.id === view.entryId) : undefined;
-
-  /* Phase 2 yard view state: the sim snapshot for THIS resident (a stale
-   * snapshot from a previous resident is never rendered). */
-  const simForCurrent = !!simView && simView.instanceId === current.instanceId;
-  const walkerX = simForCurrent ? simView.x : 50;
-  const walkerY = simForCurrent ? simView.y : 55;
-  /* Sleep pose follows the sim's action (§5.2 — a pose per category):
-   * a real bed is a full sleep; any other rest advertiser (cushion pile,
-   * sunny spot, shade tree) or the cuddle rug is a doze. */
-  const simSleep: SleepState | undefined = !simForCurrent
-    ? undefined
-    : simView.mode === 'acting' && simView.action?.defId === 'bed'
-      ? 'asleep'
-      : simView.mode === 'acting' &&
-          (simView.action?.category === 'rest' || simView.action?.defId === 'cuddle-rug')
-        ? 'sleepy'
-        : 'awake';
+  const selectedSnap = simViews[selected.instanceId];
+  const pendingName = pendingResident?.name ?? pending?.animalSnapshot.name ?? selected.name;
 
   return (
     <Shell>
@@ -784,8 +942,10 @@ export default function App() {
         <>
           <section className="relative rounded-3xl bg-gradient-to-b from-sky-200 via-green-100 to-green-200 border border-green-200 shadow-sm px-4 pt-10 pb-4 overflow-hidden">
             {/* Phase 2 yard: advertiser props at their sim anchors, and
-                the resident walking between them (the walker is an HTML
-                wrapper — the rig's transforms are never touched). */}
+                EVERY resident walking between them (each walker is an HTML
+                wrapper — the rig's transforms are never touched). Tap a
+                walker to select that resident for the care panel below;
+                the selected one wears a golden ring and its name tag. */}
             <div className="relative mx-auto w-full max-w-[540px] h-[430px]" data-yard>
               {YARD_LAYOUT.map((inst) => (
                 <div
@@ -801,58 +961,86 @@ export default function App() {
                   <YardProp defId={inst.def.id} />
                 </div>
               ))}
-              <div
-                className="yard-walker absolute w-[36%]"
-                style={{
-                  left: `${walkerX}%`,
-                  top: `${walkerY}%`,
-                  transform: 'translate(-50%, -84%)',
-                }}
-              >
-                <AnimalStage
-                  key={current.instanceId}
-                  ref={stageRef}
-                  species={current.species as SpeciesId}
-                  outfit={current.outfit}
-                  instanceId={current.instanceId}
-                  traitId={current.traitId}
-                  idle
-                  initialLine={currentTrait ? currentTrait.kidLine : null}
-                  sleepOverride={simSleep}
-                />
-                {simForCurrent && simView.thought && (
+              {game.residents.map((r, idx) => {
+                const snap = simViews[r.instanceId];
+                const isSel = r.instanceId === selected.instanceId;
+                const trait =
+                  r.traitId && r.traitId in TRAITS ? TRAITS[r.traitId as TraitId] : null;
+                return (
                   <div
-                    className="absolute -top-2 right-0 z-20 rounded-full bg-white border border-amber-200 shadow px-2 py-1 text-lg animate-pop-in"
-                    data-thought={simView.thought}
-                    aria-hidden
+                    key={r.instanceId}
+                    className={`yard-walker absolute w-[36%] rounded-[3rem] cursor-pointer ${
+                      isSel
+                        ? 'ring-4 ring-amber-400 shadow-[0_0_24px_rgba(251,191,36,0.55)]'
+                        : ''
+                    }`}
+                    style={{
+                      left: `${snap ? snap.x : 38 + idx * 10}%`,
+                      top: `${snap ? snap.y : 55}%`,
+                      transform: 'translate(-50%, -84%)',
+                      zIndex: isSel ? 40 : 10 + idx,
+                    }}
+                    data-resident={r.instanceId}
+                    data-selected={isSel ? 'true' : 'false'}
+                    role="button"
+                    aria-label={`Select ${r.name}`}
+                    onClick={() => setSelectedId(r.instanceId)}
                   >
-                    {NEED_ICONS[simView.thought]}
+                    <AnimalStage
+                      ref={(h) => {
+                        if (h) stageRefs.current.set(r.instanceId, h);
+                        else stageRefs.current.delete(r.instanceId);
+                      }}
+                      species={r.species as SpeciesId}
+                      outfit={r.outfit}
+                      instanceId={r.instanceId}
+                      traitId={r.traitId}
+                      idle
+                      initialLine={trait ? trait.kidLine : null}
+                      sleepOverride={sleepOf(snap)}
+                    />
+                    {snap?.thought && (
+                      <div
+                        className="absolute -top-2 right-0 z-20 rounded-full bg-white border border-amber-200 shadow px-2 py-1 text-lg animate-pop-in"
+                        data-thought={snap.thought}
+                        aria-hidden
+                      >
+                        {NEED_ICONS[snap.thought]}
+                      </div>
+                    )}
+                    {isSel && (
+                      <div className="absolute left-1/2 -translate-x-1/2 -bottom-2 z-20 rounded-full bg-amber-400 text-amber-950 text-xs font-extrabold px-2.5 py-0.5 shadow whitespace-nowrap pointer-events-none">
+                        {r.name}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+                );
+              })}
             </div>
           </section>
 
           <section className="mt-3 rounded-3xl bg-white/90 border border-amber-200 p-4 shadow-sm">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
               <input
-                value={current.name}
-                onChange={(e) => commit({ ...game, current: { ...current, name: e.target.value } })}
+                value={selected.name}
+                onChange={(e) =>
+                  commit(replaceResident(game, { ...selected, name: e.target.value }))
+                }
                 aria-label="Rescue's name"
                 className="text-2xl font-bold bg-transparent border-b-2 border-dashed border-amber-300 focus:border-amber-500 outline-none w-44"
               />
-              <span className="text-lg tracking-tight" aria-label={`${current.hearts} of 8 hearts`}>
+              <span className="text-lg tracking-tight" aria-label={`${selected.hearts} of 8 hearts`}>
                 {Array.from({ length: 8 }, (_, i) => (
-                  <span key={i}>{i < current.hearts ? '❤️' : '🤍'}</span>
+                  <span key={i}>{i < selected.hearts ? '❤️' : '🤍'}</span>
                 ))}
               </span>
-              <TraitChip traitId={current.traitId} />
+              <TraitChip traitId={selected.traitId} />
             </div>
 
             {game.phase === 'caring' && (
               <div className="grid grid-cols-5 gap-2 mt-4">
                 {CARE_ACTION_LIST.map((a) => {
-                  const isFav = currentTrait?.loves === a.id;
+                  const isFav = selectedTrait?.loves === a.id;
                   return (
                     <button
                       key={a.id}
@@ -882,10 +1070,10 @@ export default function App() {
               {game.pendingAdoption ? (
                 <>
                   <h2 className="text-xl font-extrabold text-center">
-                    {current.name} is ready for a forever home! 💛
+                    {pendingName} is ready for a forever home! 💛
                   </h2>
                   <p className="text-center text-stone-600 mt-1 mb-4">
-                    Who will {current.name} live with? ✨ Sanctuary's Pick is our suggestion — every home is a happy home.
+                    Who will {pendingName} live with? ✨ Sanctuary's Pick is our suggestion — every home is a happy home.
                   </p>
                   <div className="grid sm:grid-cols-3 gap-3">
                     {game.pendingAdoption.offerIds.map((id) => {
@@ -895,7 +1083,7 @@ export default function App() {
                           key={id}
                           adopter={adopter}
                           isPick={id === game.pendingAdoption!.pickId}
-                          hint={profile ? hintFor(profile, adopter) : null}
+                          hint={pendingProfile ? hintFor(pendingProfile, adopter) : null}
                           onPick={() => handleChooseAdopter(id)}
                         />
                       );
@@ -927,10 +1115,10 @@ export default function App() {
                     </button>
                     <button
                       type="button"
-                      onClick={handleNextRescue}
+                      onClick={handleBackToYard}
                       className="rounded-full bg-green-500 hover:bg-green-400 text-white font-bold px-5 py-2.5 shadow"
                     >
-                      Meet the next rescue →
+                      Back to the yard →
                     </button>
                   </div>
                 </div>
@@ -944,7 +1132,7 @@ export default function App() {
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
               {OUTFITS.map((o) => {
                 const owned = game.ownedItems.includes(o.id);
-                const worn = current.outfit === o.id;
+                const worn = selected.outfit === o.id;
                 return (
                   <div key={o.id} className="rounded-2xl border border-stone-200 bg-stone-50 p-3 text-center">
                     <div className="text-3xl" aria-hidden>{o.icon}</div>
@@ -1060,26 +1248,26 @@ export default function App() {
         )}
       </footer>
 
-      {DEBUG && simView && (
+      {DEBUG && selectedSnap && (
         <div
           className="fixed left-2 bottom-2 z-50 rounded-xl bg-white/95 border border-stone-300 shadow px-3 py-2 text-[11px] font-mono leading-relaxed text-stone-700"
           data-testid="yard-debug"
         >
           <div>
-            ⏱ {simView.time.toFixed(1)}s · {simView.mode}
-            {simView.action
-              ? ` · ${simView.action.phase} → ${simView.action.defId}`
+            {selected.instanceId} · ⏱ {selectedSnap.time.toFixed(1)}s · {selectedSnap.mode}
+            {selectedSnap.action
+              ? ` · ${selectedSnap.action.phase} → ${selectedSnap.action.defId}`
               : ''}{' '}
-            · decisions {simView.decisionCount}
+            · decisions {selectedSnap.decisionCount}
           </div>
           <div>
-            🍖 {simView.needs.tummy.toFixed(1)} · 💤 {simView.needs.energy.toFixed(1)} · 🫧{' '}
-            {simView.needs.clean.toFixed(1)} · 🎾 {simView.needs.fun.toFixed(1)} · ❤️{' '}
-            {simView.needs.affection.toFixed(1)}
+            🍖 {selectedSnap.needs.tummy.toFixed(1)} · 💤 {selectedSnap.needs.energy.toFixed(1)} · 🫧{' '}
+            {selectedSnap.needs.clean.toFixed(1)} · 🎾 {selectedSnap.needs.fun.toFixed(1)} · ❤️{' '}
+            {selectedSnap.needs.affection.toFixed(1)}
           </div>
           <div>
             top:{' '}
-            {simView.topScores.map((s) => `${s.id} ${s.score.toFixed(2)}`).join(' · ') ||
+            {selectedSnap.topScores.map((s) => `${s.id} ${s.score.toFixed(2)}`).join(' · ') ||
               '—'}
           </div>
         </div>

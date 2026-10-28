@@ -11,13 +11,24 @@ import { z } from 'zod';
 // migration generates the new fields via the AI stream. Album entries are
 // untouched: forever-home animals get NO needs and NO aiProfile (§7.3).
 //
+// v6 = v5 with the single current rescue generalized to a `residents`
+// list (Phase 2 step 2B, Amanda's ruling: each rescue has its own hearts;
+// an adopted one leaves and a new rescue arrives). The rescue record
+// itself is unchanged — a resident IS the v5 rescue record. The yard cap
+// (4) is a schema bound as well as a game rule, so an over-full document
+// is a loud programmer error, never a silent bad save.
+//
 // Fencing rules carried over from the audit, binding forever:
 //  - additive-only: never rename, never re-type, never make a field required
 //    in a way an older save could fail;
 //  - unknown keys are stripped on parse (zod default), never preserved;
 //  - a save that fails validation is NEVER overwritten by the loader.
 
-export const CURRENT_SAVE_VERSION = 5;
+export const CURRENT_SAVE_VERSION = 6;
+
+/** The yard's resident cap (Amanda's "about four residents"). Arrivals
+ * stop at the cap; the schema enforces it as a hard bound. */
+export const MAX_RESIDENTS = 4;
 
 export const SPECIES_IDS = [
   'dog',
@@ -139,6 +150,9 @@ export const albumEntrySchema = z.object({
 export type AlbumEntry = z.infer<typeof albumEntrySchema>;
 
 export const pendingAdoptionSchema = z.object({
+  // v6: which resident this frozen offer belongs to. A celebration is
+  // always FOR one named resident; the others keep living around it.
+  residentInstanceId: z.string(),
   animalSnapshot: z.object({
     name: z.string(),
     species: z.string(),
@@ -204,7 +218,8 @@ export const gameStateSchema = z.object({
   adoptedCount: z.number().int().min(0),
   rotationIndex: z.number().int().min(0),
   phase: z.enum(['caring', 'celebration']),
-  current: rescueSchema,
+  // v6: the yard's residents (was the single `current` rescue in ≤v5).
+  residents: z.array(rescueSchema).min(1).max(MAX_RESIDENTS),
   album: z.array(albumEntrySchema),
   // Stage 2a root:
   rngSeed: z.number().int().min(0).max(4294967295),
