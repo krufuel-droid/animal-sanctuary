@@ -31,7 +31,12 @@ export const TUNING = {
   criticalDeficit: 0.85,
   postCareGraceSec: 4,
   postCareCategoryFactor: 0.5,
-  postCareCategorySec: 10,
+  // Step 2 raised this 10 → 60: §8's H7 player-respect assertion measures
+  // a 60 s no-same-category window after care, and step 1's probe caught a
+  // Foodie re-picking the bowl at +18.9 s — legal under §3.5's 10 s prose,
+  // a violation of H7's 60 s. The 60 s window is the one §6.2's metrics
+  // table also uses, so the knob now matches the assertion that guards it.
+  postCareCategorySec: 60,
   distanceFalloff: 0.35,
   congestionSecondFactor: 0.67,
   bodyWinsSatisfaction: 10,

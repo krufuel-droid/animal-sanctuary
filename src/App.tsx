@@ -718,11 +718,15 @@ export default function App() {
   const simForCurrent = !!simView && simView.instanceId === current.instanceId;
   const walkerX = simForCurrent ? simView.x : 50;
   const walkerY = simForCurrent ? simView.y : 55;
+  /* Sleep pose follows the sim's action (§5.2 — a pose per category):
+   * a real bed is a full sleep; any other rest advertiser (cushion pile,
+   * sunny spot, shade tree) or the cuddle rug is a doze. */
   const simSleep: SleepState | undefined = !simForCurrent
     ? undefined
     : simView.mode === 'acting' && simView.action?.defId === 'bed'
       ? 'asleep'
-      : simView.mode === 'acting' && simView.action?.defId === 'cuddle-rug'
+      : simView.mode === 'acting' &&
+          (simView.action?.category === 'rest' || simView.action?.defId === 'cuddle-rug')
         ? 'sleepy'
         : 'awake';
 

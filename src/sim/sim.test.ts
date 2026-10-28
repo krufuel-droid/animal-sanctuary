@@ -12,7 +12,12 @@ import {
   aiSeedFor,
   deriveAiProfile,
 } from './traits-ai';
-import { ADVERTISERS, type AdvertiserDef, type AdvertiserInstance } from './advertisers';
+import {
+  ADVERTISERS,
+  YARD_LAYOUT,
+  type AdvertiserDef,
+  type AdvertiserInstance,
+} from './advertisers';
 import { scoreAdvertisers, pickChoice, type ScoreEnv } from './brain';
 import { YardSim } from './yardSim';
 
@@ -277,6 +282,264 @@ describe('H2 — bounds over a long unattended run', () => {
     // abort rate of a recompute-and-compare hysteresis failure.
     expect(aborted / started).toBeLessThan(0.25);
     expect(completed).toBeGreaterThan(started * 0.6);
+  });
+});
+
+// --- Step 2 (part A): the full §5.1 catalogue ----------------------------
+
+describe('catalogue (§5.1) — every def matches the table, exactly', () => {
+  // id → [category, gains, durationSec, capacity, extras]
+  const TABLE: Record<
+    string,
+    {
+      category: string;
+      gains: Partial<Record<string, number>>;
+      durationSec: number;
+      capacity: number;
+      energyCost?: number;
+      globalCooldownSec?: number;
+      treatFlag?: boolean;
+    }
+  > = {
+    'food-bowl': { category: 'eat', gains: { tummy: 45, affection: 4 }, durationSec: 12, capacity: 2 },
+    'water-bowl': { category: 'eat', gains: { tummy: 10 }, durationSec: 4, capacity: 3 },
+    'treat-jar': {
+      category: 'eat', gains: { tummy: 16, fun: 12 }, durationSec: 5, capacity: 1,
+      globalCooldownSec: 45, treatFlag: true,
+    },
+    bed: { category: 'rest', gains: { energy: 55 }, durationSec: 20, capacity: 1 },
+    'cushion-pile': { category: 'rest', gains: { energy: 30 }, durationSec: 12, capacity: 3 },
+    'sunny-spot': { category: 'rest', gains: { energy: 18, affection: 10 }, durationSec: 15, capacity: 2 },
+    'shade-tree': { category: 'rest', gains: { energy: 14, fun: 8 }, durationSec: 12, capacity: 3 },
+    'toy-box': { category: 'play', gains: { fun: 40 }, durationSec: 14, capacity: 2, energyCost: 6 },
+    'ball-patch': { category: 'play', gains: { fun: 30 }, durationSec: 10, capacity: 1, energyCost: 5 },
+    'scratch-post': { category: 'play', gains: { fun: 22, clean: 10 }, durationSec: 8, capacity: 1 },
+    'bath-tub': { category: 'groom', gains: { clean: 55 }, durationSec: 14, capacity: 1 },
+    'grooming-station': { category: 'groom', gains: { clean: 32, affection: 10 }, durationSec: 10, capacity: 1 },
+    'cuddle-rug': { category: 'cuddle', gains: { affection: 35, energy: 12 }, durationSec: 14, capacity: 3 },
+    wander: { category: 'explore', gains: { fun: 10, affection: 4 }, durationSec: 6, capacity: Infinity },
+  };
+
+  it('has exactly the §5.1 object defs plus the wander fallback (no nuzzle yet)', () => {
+    expect(Object.keys(ADVERTISERS).sort()).toEqual(Object.keys(TABLE).sort());
+  });
+
+  it('every def carries the table values', () => {
+    for (const [id, want] of Object.entries(TABLE)) {
+      const def = ADVERTISERS[id];
+      expect(def, id).toBeDefined();
+      expect(def.category, id).toBe(want.category);
+      expect(def.gains, id).toEqual(want.gains);
+      expect(def.durationSec, id).toBe(want.durationSec);
+      expect(def.capacity, id).toBe(want.capacity);
+      expect(def.energyCost, id).toBe(want.energyCost);
+      expect(def.globalCooldownSec, id).toBe(want.globalCooldownSec);
+      expect(def.treatFlag, id).toBe(want.treatFlag);
+    }
+  });
+
+  it('layout: 15 instances, two bowls and two beds placed apart, nothing crowded', () => {
+    expect(YARD_LAYOUT).toHaveLength(15);
+    const keys = YARD_LAYOUT.map((i) => i.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    const ofDef = (id: string) => YARD_LAYOUT.filter((i) => i.def.id === id);
+    expect(ofDef('food-bowl')).toHaveLength(2);
+    expect(ofDef('bed')).toHaveLength(2);
+    const [b1, b2] = ofDef('food-bowl');
+    expect(Math.hypot(b1.x - b2.x, b1.y - b2.y)).toBeGreaterThanOrEqual(15);
+    for (const inst of YARD_LAYOUT) {
+      expect(inst.x).toBeGreaterThanOrEqual(5);
+      expect(inst.x).toBeLessThanOrEqual(95);
+      expect(inst.y).toBeGreaterThanOrEqual(28);
+      expect(inst.y).toBeLessThanOrEqual(92);
+    }
+    for (let i = 0; i < YARD_LAYOUT.length; i++) {
+      for (let j = i + 1; j < YARD_LAYOUT.length; j++) {
+        const a = YARD_LAYOUT[i];
+        const b = YARD_LAYOUT[j];
+        expect(
+          Math.hypot(a.x - b.x, a.y - b.y),
+          `${a.key} vs ${b.key}`,
+        ).toBeGreaterThanOrEqual(14);
+      }
+    }
+    // Step 1's anchors are unchanged (the yard grew around them).
+    const at = (key: string) => YARD_LAYOUT.find((i) => i.key === key)!;
+    expect([at('food-bowl-1').x, at('food-bowl-1').y]).toEqual([17, 79]);
+    expect([at('bed-1').x, at('bed-1').y]).toEqual([83, 80]);
+    expect([at('toy-box').x, at('toy-box').y]).toEqual([50, 87]);
+    expect([at('bath-tub').x, at('bath-tub').y]).toEqual([16, 38]);
+    expect([at('cuddle-rug').x, at('cuddle-rug').y]).toEqual([83, 38]);
+  });
+});
+
+describe('treat jar — the global-cooldown eligibility gate (§5.1, §3.2)', () => {
+  const jarInstance = YARD_LAYOUT.find((i) => i.def.id === 'treat-jar')!;
+
+  it('brain level: on global cooldown the jar is not scored at all', () => {
+    const resident = {
+      instanceId: 'mischief',
+      traitId: 'mischievous' as const,
+      weights: { ...TRAIT_NEED_WEIGHTS.mischievous },
+      needs: { tummy: 55, energy: 70, clean: 70, fun: 50, affection: 65 },
+      x: 50,
+      y: 55,
+    };
+    const cooling = scoreAdvertisers(
+      resident,
+      [jarInstance],
+      envFor({ now: 100, globalCooldownUntil: { 'treat-jar': 145 } }),
+    );
+    expect(cooling[0].eligible).toBe(false);
+    const refilled = scoreAdvertisers(
+      resident,
+      [jarInstance],
+      envFor({ now: 146, globalCooldownUntil: { 'treat-jar': 145 } }),
+    );
+    expect(refilled[0].eligible).toBe(true);
+  });
+
+  it('sim level: after a jar use, no new jar action starts for 45 s', () => {
+    const sim = makeSim({
+      instanceId: 'arr-4',
+      traitId: 'mischievous',
+      weights: { ...TRAIT_NEED_WEIGHTS.mischievous },
+      needs: { tummy: 60, energy: 70, clean: 70, fun: 85, affection: 65 },
+      rngSeed: 99,
+      arrivalIndex: 4,
+    });
+    for (let i = 0; i < 36000; i++) sim.step(0.1); // one sim-hour
+    const starts = sim.events
+      .filter((e) => e.type === 'actionStarted' && e.defId === 'treat-jar')
+      .map((e) => e.t);
+    const done = sim.events
+      .filter((e) => e.type === 'actionCompleted' && e.defId === 'treat-jar')
+      .map((e) => e.t);
+    expect(done.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < starts.length; i++) {
+      // Event times are rounded to 0.1 s; the gate is 45 s from completion.
+      expect(starts[i] - done[i - 1]).toBeGreaterThanOrEqual(45 - 0.11);
+    }
+  });
+});
+
+// --- H7 (§8) — player respect, the step-2 tuning question -----------------
+//
+// FINDING (measured Oct 28, 2026; reported to Amanda via the parent):
+// with postCareCategorySec raised 10 → 60, H7 holds exactly as written
+// when care lands at a random moment in a lived-in yard (the resident has
+// usually self-served, so Feed caps Tummy at 100 and no eat advertiser
+// can pull for a full minute). It does NOT hold in the sharpest case —
+// a Foodie interrupted mid-walk to the bowl, where the refill only
+// reaches 65: the halved bowl still wins a decision at +28…+41 s
+// (8/8 seeds), with Tummy never below 58, so the <35 exemption never
+// applies. At the old 10 s the same case broke at +15…+35 s and the
+// random-moment shape broke too (22/24 violations vs 8/24), so 60 s is
+// the closest single-knob value; per the step-2 brief no second
+// mechanism was stacked to force it. The tests below pin both halves of
+// that measured reality so any future tuning change shows up here first.
+
+function foodieSim(seed: number, needs: Needs, arrivalIndex = 2) {
+  return new YardSim({
+    instanceId: `arr-${arrivalIndex}`,
+    traitId: 'foodie',
+    weights: { ...TRAIT_NEED_WEIGHTS.foodie },
+    metabolism: 1,
+    needs: { ...needs },
+    rngSeed: seed,
+    arrivalIndex,
+  });
+}
+
+function postCareEatStarts(sim: YardSim, careT: number, windowSec: number) {
+  return sim.events.filter(
+    (e) =>
+      e.type === 'actionStarted' &&
+      e.category === 'eat' &&
+      e.t > careT &&
+      e.t <= careT + windowSec,
+  );
+}
+
+describe('H7 (§8) — zero same-category choices for 60 s after care', () => {
+  const SEEDS = [1, 7, 42, 777, 12345, 424242, 897955649, 2026];
+
+  it('holds at random moments: Feed in a lived-in yard (8 seeds × 2 moments)', () => {
+    for (const seed of SEEDS) {
+      for (const careAt of [53, 137]) {
+        const sim = foodieSim(seed, { ...NEEDS_60 }, 3);
+        for (let i = 0; i < careAt * 10; i++) sim.step(0.1);
+        sim.applyCare('feed');
+        const careT = sim.time;
+        // The precondition the dive assumes: the refill visibly landed.
+        expect(sim.getNeeds().tummy).toBeGreaterThanOrEqual(90);
+        for (let i = 0; i < 900; i++) sim.step(0.1);
+        expect(
+          postCareEatStarts(sim, careT, 60),
+          `seed ${seed} @${careAt}s`,
+        ).toHaveLength(0);
+        // …and the resident is not food-avoidant afterwards: it eats
+        // again within the same sim-day.
+        const later = sim.events.filter(
+          (e) => e.type === 'actionStarted' && e.category === 'eat' && e.t > careT,
+        );
+        expect(later.length, `seed ${seed} @${careAt}s`).toBeGreaterThanOrEqual(1);
+        expect(later[0].t - careT).toBeLessThanOrEqual(360);
+      }
+    }
+  });
+
+  it('worst case (interrupted bowl-walk, refill to 65): respected ≥25 s, strict 60 s NOT met', () => {
+    for (const seed of SEEDS) {
+      const sim = foodieSim(seed, {
+        tummy: 35, energy: 80, clean: 75, fun: 70, affection: 70,
+      });
+      // Wait for the beeline, then interrupt it — the D2 shape.
+      let guard = 0;
+      while (guard++ < 6000) {
+        sim.step(0.1);
+        const s = sim.snapshot();
+        if (s.mode === 'travel' && s.action?.category === 'eat') break;
+      }
+      const tummyBefore = sim.getNeeds().tummy;
+      sim.applyCare('feed');
+      const careT = sim.time;
+      expect(sim.snapshot().mode).toBe('withPlayer');
+      expect(sim.getNeeds().tummy).toBeCloseTo(Math.min(100, tummyBefore + 30), 0);
+      let minTummy = Infinity;
+      for (let i = 0; i < 900; i++) {
+        sim.step(0.1);
+        if (sim.time <= careT + 60) minTummy = Math.min(minTummy, sim.getNeeds().tummy);
+      }
+      // The care WAS respected for a solid window in every seed…
+      expect(postCareEatStarts(sim, careT, 25), `seed ${seed}`).toHaveLength(0);
+      // …but the strict H7 window is not met: the first eat choice lands
+      // inside (25, 60] with Tummy far above the <35 exemption.
+      const inWindow = postCareEatStarts(sim, careT, 60);
+      expect(inWindow.length, `seed ${seed}`).toBeGreaterThanOrEqual(1);
+      expect(minTummy).toBeGreaterThanOrEqual(35);
+    }
+  });
+});
+
+describe('diversity sanity (§6.2) — the full catalogue actually gets lived in', () => {
+  it('one Gentle resident over two sim-days uses at least 6 distinct advertisers', () => {
+    const sim = makeSim({
+      traitId: 'gentle',
+      weights: { ...TRAIT_NEED_WEIGHTS.gentle },
+      needs: { ...NEEDS_60 },
+    });
+    for (let i = 0; i < 72000; i++) sim.step(0.1); // 7200 sim-seconds
+    const used = new Set(
+      sim.events.filter((e) => e.type === 'actionStarted').map((e) => e.defId),
+    );
+    expect(used.size).toBeGreaterThanOrEqual(6);
+    const NEW_DEFS = [
+      'water-bowl', 'treat-jar', 'cushion-pile', 'sunny-spot',
+      'shade-tree', 'ball-patch', 'scratch-post', 'grooming-station',
+    ];
+    const newUsed = NEW_DEFS.filter((id) => used.has(id));
+    expect(newUsed.length).toBeGreaterThanOrEqual(3);
   });
 });
 
