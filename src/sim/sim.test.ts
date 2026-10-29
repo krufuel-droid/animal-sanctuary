@@ -15,6 +15,7 @@ import {
 import {
   ADVERTISERS,
   YARD_LAYOUT,
+  nuzzleInstance,
   type AdvertiserDef,
   type AdvertiserInstance,
 } from './advertisers';
@@ -321,11 +322,16 @@ describe('catalogue (§5.1) — every def matches the table, exactly', () => {
     'bath-tub': { category: 'groom', gains: { clean: 55 }, durationSec: 14, capacity: 1 },
     'grooming-station': { category: 'groom', gains: { clean: 32, affection: 10 }, durationSec: 10, capacity: 1 },
     'cuddle-rug': { category: 'cuddle', gains: { affection: 35, energy: 12 }, durationSec: 14, capacity: 3 },
+    // Step 2C: §5.1's dynamic row — no yard placement; instances are
+    // generated per eligible partner at score time (§5.2).
+    'friend-nuzzle': { category: 'social', gains: { affection: 25, fun: 16 }, durationSec: 8, capacity: 1 },
     wander: { category: 'explore', gains: { fun: 10, affection: 4 }, durationSec: 6, capacity: Infinity },
   };
 
-  it('has exactly the §5.1 object defs plus the wander fallback (no nuzzle yet)', () => {
+  it('has exactly the §5.1 defs plus the wander fallback', () => {
     expect(Object.keys(ADVERTISERS).sort()).toEqual(Object.keys(TABLE).sort());
+    // The nuzzle is the catalogue's only resident-sourced def (§5.2).
+    expect(ADVERTISERS['friend-nuzzle'].source).toBe('resident');
   });
 
   it('every def carries the table values', () => {
@@ -742,5 +748,398 @@ describe('§3.5 rule 4 — gains bank continuously; interruption wastes nothing'
     expect(sim.snapshot().mode).toBe('withPlayer');
     // The Pet refill (+25 affection) landed instantly with the interrupt.
     expect(after.affection).toBeCloseTo(Math.min(100, aff0 + 25), 4);
+  });
+});
+
+// --- Step 2C: friend nuzzle — the dynamic social advertiser (§5.1/§5.2) --
+//
+// Shipped WITHOUT bond accumulation (§9 Q6, the parent's ruling): a
+// nuzzle is pure need-filling — no pair state persists anywhere, and the
+// save schema does not change. The initiator banks Love +25 / Fun +16
+// over 8 s; the partner banks half; the partner takes no cooldown for
+// being chosen; either side ending (care, override, removal) releases
+// the other with banked gains kept.
+
+describe('friend nuzzle (step 2C) — the dynamic social advertiser', () => {
+  type TraitKey = keyof typeof TRAIT_NEED_WEIGHTS;
+
+  function mkRes(
+    instanceId: string,
+    traitId: TraitKey,
+    needs: Needs,
+    extra: Partial<YardSimResidentOptions> = {},
+  ): YardSimResidentOptions {
+    return {
+      instanceId,
+      traitId,
+      weights: { ...TRAIT_NEED_WEIGHTS[traitId] },
+      metabolism: 1,
+      needs: { ...needs },
+      rngSeed: 31337,
+      arrivalIndex: Number(instanceId.split('-')[1] ?? 1),
+      ...extra,
+    };
+  }
+
+  const CONTENT: Needs = { tummy: 88, energy: 88, clean: 88, fun: 88, affection: 88 };
+  const NEEDY: Needs = { tummy: 90, energy: 90, clean: 90, fun: 30, affection: 25 };
+  // The partner starts mid-scale on Love/Fun so the 100 clamp can never
+  // eat the half gains the banking assertions measure (an 88-start
+  // partner pre-banks its way to the clamp before the nuzzle begins).
+  const PARTNER: Needs = { tummy: 88, energy: 88, clean: 88, fun: 60, affection: 40 };
+
+  /** A pair set up so a nuzzle happens immediately and cleanly: the
+   * initiator (arr-2, decision stagger 0.13 s) is a needy Gentle
+   * resident — no cuddle affinity inflating the rug — standing close to
+   * a mid-scale partner (arr-7, stagger 1.94 s) who is still in its
+   * initial idle when the initiator arrives (~0.5 s). rngSeed 4 makes
+   * the initiator's first roulette pick the nuzzle; both facts were
+   * verified against the live sim, and the pairing is deterministic. */
+  function courtshipSim() {
+    return new YardSim({
+      residents: [
+        mkRes('arr-2', 'gentle', NEEDY, { startPos: { x: 30, y: 55 }, rngSeed: 4 }),
+        mkRes('arr-7', 'sleepy', PARTNER, { startPos: { x: 38, y: 55 }, rngSeed: 4 }),
+      ],
+    });
+  }
+
+  /** Step until some pair is ACTING a nuzzle; report who initiated.
+   * Roles come from the LATEST nuzzle start whose pair is acting right
+   * now — an old start event (a completed pair, a partner-busy miss)
+   * must never pin the roles: the snapshot linkage is symmetric, so a
+   * stale event would silently swap initiator and partner. */
+  function engageNuzzle(sim: YardSim, guardTicks = 9000) {
+    for (let i = 0; i < guardTicks; i++) {
+      sim.step(0.1);
+      for (let j = sim.events.length - 1; j >= 0; j--) {
+        const start = sim.events[j];
+        if (start.type !== 'actionStarted' || start.defId !== 'friend-nuzzle') {
+          continue;
+        }
+        const initiatorId = start.instanceId;
+        const partnerId = sim
+          .snapshots()
+          .find((s) => s.instanceId !== initiatorId)?.instanceId;
+        if (!partnerId) break;
+        const a = sim.snapshot(initiatorId);
+        const b = sim.snapshot(partnerId);
+        if (
+          a.action?.defId === 'friend-nuzzle' &&
+          a.action?.phase === 'acting' &&
+          b.action?.defId === 'friend-nuzzle' &&
+          b.action?.phase === 'acting' &&
+          b.action?.partnerId === initiatorId
+        ) {
+          return { initiatorId, partnerId };
+        }
+        break; // only the latest start can describe the live pair
+      }
+    }
+    return null;
+  }
+
+  it('emits a candidate per eligible partner — and only then', () => {
+    // Absent partner: a lone resident never sees a nuzzle candidate.
+    const solo = new YardSim({ residents: [mkRes('arr-1', 'gentle', NEEDS_60)] });
+    expect(
+      solo.candidatesFor('arr-1').some((c) => c.defId === 'friend-nuzzle'),
+    ).toBe(false);
+
+    // Idle partner: exactly one candidate, keyed by the partner, eligible.
+    const sim = new YardSim({
+      residents: [mkRes('arr-1', 'gentle', NEEDS_60), mkRes('arr-2', 'playful', NEEDS_60)],
+    });
+    const cands = sim
+      .candidatesFor('arr-1')
+      .filter((c) => c.defId === 'friend-nuzzle');
+    expect(cands).toHaveLength(1);
+    expect(cands[0].instanceKey).toBe('nuzzle-with:arr-2');
+    expect(cands[0].eligible).toBe(true);
+
+    // withPlayer partner: the candidate vanishes (player respect, §3.2).
+    sim.applyCare('arr-2', 'pet');
+    expect(sim.snapshot('arr-2').mode).toBe('withPlayer');
+    expect(
+      sim.candidatesFor('arr-1').some((c) => c.defId === 'friend-nuzzle'),
+    ).toBe(false);
+  });
+
+  it('emits no candidate while the partner is travelling or acting (incl. asleep)', () => {
+    // A sleepy partner far from the beds: first travelling, then acting.
+    const sim = new YardSim({
+      residents: [
+        mkRes('arr-1', 'gentle', NEEDS_60),
+        mkRes(
+          'arr-2',
+          'sleepy',
+          { tummy: 85, energy: 12, clean: 85, fun: 85, affection: 85 },
+          { startPos: { x: 15, y: 88 } },
+        ),
+      ],
+    });
+    let sawTravel = false;
+    let sawActing = false;
+    for (let i = 0; i < 4000 && !(sawTravel && sawActing); i++) {
+      sim.step(0.1);
+      const partner = sim.snapshot('arr-2');
+      const hasCandidate = sim
+        .candidatesFor('arr-1')
+        .some((c) => c.defId === 'friend-nuzzle');
+      if (partner.mode === 'travel' && partner.action?.defId !== 'wander') {
+        sawTravel = true;
+        expect(hasCandidate, 'travelling partner').toBe(false);
+      }
+      if (
+        partner.mode === 'acting' &&
+        partner.action &&
+        ADVERTISERS[partner.action.defId].source === 'object'
+      ) {
+        sawActing = true;
+        expect(hasCandidate, `acting partner (${partner.action.defId})`).toBe(false);
+      }
+      // Asleep is acting on the bed: the same gate, pinned explicitly.
+      if (partner.mode === 'acting' && partner.action?.defId === 'bed') {
+        expect(hasCandidate, 'asleep partner').toBe(false);
+      }
+    }
+    expect(sawTravel).toBe(true);
+    expect(sawActing).toBe(true);
+  });
+
+  it('scores through §3.1 on the initiator — Shy social affinity ×0.85 (§4.2)', () => {
+    expect(affinityFor('shy', ADVERTISERS['friend-nuzzle'])).toBe(0.85);
+    expect(affinityFor('gentle', ADVERTISERS['friend-nuzzle'])).toBe(1);
+    // Identical bodies and weights; only the trait (hence affinity)
+    // differs, so the score ratio is the affinity itself.
+    const instance = nuzzleInstance('arr-9', 60, 55);
+    const body = (traitId: TraitKey) => ({
+      instanceId: 'arr-1',
+      traitId,
+      weights: { tummy: 1, energy: 1, clean: 1, fun: 1, affection: 1 },
+      needs: { tummy: 90, energy: 90, clean: 90, fun: 40, affection: 40 },
+      x: 50,
+      y: 55,
+    });
+    const shy = scoreAdvertisers(body('shy'), [instance], envFor())[0];
+    const gentle = scoreAdvertisers(body('gentle'), [instance], envFor())[0];
+    expect(shy.eligible).toBe(true);
+    expect(gentle.eligible).toBe(true);
+    expect(shy.score / gentle.score).toBeCloseTo(0.85, 10);
+  });
+
+  it('a completed nuzzle banks +25/+16 for the initiator, half for the partner', () => {
+    const sim = courtshipSim();
+    const pair = engageNuzzle(sim);
+    expect(pair).not.toBeNull();
+    const { initiatorId, partnerId } = pair!;
+    const before = {
+      init: sim.getNeeds(initiatorId),
+      part: sim.getNeeds(partnerId),
+    };
+    // Run until the pair separates (8 s of banking, plus slack).
+    for (let i = 0; i < 300; i++) {
+      sim.step(0.1);
+      const a = sim.snapshot(initiatorId);
+      const b = sim.snapshot(partnerId);
+      if (a.action?.defId !== 'friend-nuzzle' && b.action?.defId !== 'friend-nuzzle') break;
+    }
+    const after = {
+      init: sim.getNeeds(initiatorId),
+      part: sim.getNeeds(partnerId),
+    };
+    // Full gains minus ~1.1–1.2 of decay over the 8 s (§1.3 rates).
+    expect(after.init.affection - before.init.affection).toBeGreaterThan(21);
+    expect(after.init.affection - before.init.affection).toBeLessThan(25.6);
+    expect(after.init.fun - before.init.fun).toBeGreaterThan(13);
+    expect(after.init.fun - before.init.fun).toBeLessThan(16.6);
+    // Partner: exactly half, on the same decay terms.
+    expect(after.part.affection - before.part.affection).toBeGreaterThan(9.5);
+    expect(after.part.affection - before.part.affection).toBeLessThan(13.1);
+    expect(after.part.fun - before.part.fun).toBeGreaterThan(5.4);
+    expect(after.part.fun - before.part.fun).toBeLessThan(8.6);
+    // The initiator took the standard social cooldown; the partner did
+    // not — it may be chosen again (or choose) right away.
+    const initSocialStarts = sim.events.filter(
+      (e) =>
+        e.type === 'actionStarted' &&
+        e.instanceId === initiatorId &&
+        e.category === 'social',
+    ).length;
+    expect(initSocialStarts).toBe(1);
+  });
+
+  it('care on the partner mid-nuzzle keeps banked gains and frees both', () => {
+    const sim = courtshipSim();
+    const pair = engageNuzzle(sim);
+    expect(pair).not.toBeNull();
+    const { initiatorId, partnerId } = pair!;
+    const atEngage = sim.getNeeds(partnerId);
+    for (let i = 0; i < 30; i++) sim.step(0.1); // 3 s of banking
+    const midBank = sim.getNeeds(partnerId).affection;
+    expect(midBank - atEngage.affection).toBeGreaterThan(2.5);
+    // Feed touches Tummy only, so the partner's Love/Fun are a clean
+    // measure of what the nuzzle banked before the interruption.
+    sim.applyCare(partnerId, 'feed');
+    expect(sim.snapshot(partnerId).mode).toBe('withPlayer');
+    const initSnap = sim.snapshot(initiatorId);
+    expect(initSnap.action?.defId).not.toBe('friend-nuzzle');
+    const kept = sim.getNeeds(partnerId);
+    expect(kept.affection).toBeGreaterThanOrEqual(midBank - 0.05);
+    expect(kept.fun).toBeGreaterThan(atEngage.fun + 1.5);
+    // Nobody is stuck: both residents go on deciding and acting.
+    const decisions = {
+      init: sim.snapshot(initiatorId).decisionCount,
+      part: sim.snapshot(partnerId).decisionCount,
+    };
+    for (let i = 0; i < 400; i++) sim.step(0.1);
+    expect(sim.snapshot(initiatorId).decisionCount).toBeGreaterThan(decisions.init);
+    expect(sim.snapshot(partnerId).decisionCount).toBeGreaterThan(decisions.part);
+    const laterStarts = sim.events.filter(
+      (e) => e.type === 'actionStarted' && e.t > sim.time - 40,
+    );
+    expect(laterStarts.length).toBeGreaterThan(0);
+  });
+
+  it('no resident can be drawn into two nuzzles at once', () => {
+    const sim = new YardSim({
+      residents: [
+        mkRes('arr-1', 'cuddly', NEEDY, { startPos: { x: 46, y: 55 } }),
+        mkRes('arr-2', 'gentle', CONTENT, { startPos: { x: 54, y: 55 } }),
+        mkRes('arr-3', 'cuddly', NEEDY, { startPos: { x: 50, y: 78 } }),
+      ],
+    });
+    // Find a live pair (whoever it is), then watch the third resident
+    // for the pair's whole acting window.
+    let pairIds: [string, string] | null = null;
+    for (let i = 0; i < 9000 && !pairIds; i++) {
+      sim.step(0.1);
+      for (const s of sim.snapshots()) {
+        if (
+          s.action?.defId === 'friend-nuzzle' &&
+          s.action?.phase === 'acting' &&
+          s.action?.partnerId
+        ) {
+          pairIds = [s.instanceId, s.action.partnerId];
+          break;
+        }
+      }
+    }
+    expect(pairIds).not.toBeNull();
+    const third = ['arr-1', 'arr-2', 'arr-3'].find((id) => !pairIds!.includes(id))!;
+    for (let i = 0; i < 200; i++) {
+      sim.step(0.1);
+      // The window ends when the pair does; only assert while it acts.
+      const stillPaired = pairIds!.every((id) => {
+        const s = sim.snapshot(id);
+        return s.action?.defId === 'friend-nuzzle' && s.action?.phase === 'acting';
+      });
+      if (!stillPaired) break;
+      // The third resident is never in a nuzzle during the window…
+      expect(sim.snapshot(third).action?.defId).not.toBe('friend-nuzzle');
+      // …and neither paired resident is offered to it as a candidate.
+      const offered = sim
+        .candidatesFor(third)
+        .filter((c) => c.defId === 'friend-nuzzle' && c.eligible);
+      expect(offered).toHaveLength(0);
+    }
+  });
+
+  it('partner removal mid-nuzzle frees the survivor, gains kept', () => {
+    for (const removeId of ['arr-2', 'arr-7']) {
+      const sim = courtshipSim();
+      const pair = engageNuzzle(sim);
+      expect(pair).not.toBeNull();
+      for (let i = 0; i < 20; i++) sim.step(0.1); // 2 s of banking
+      const survivorId = removeId === 'arr-2' ? 'arr-7' : 'arr-2';
+      const banked = sim.getNeeds(survivorId).affection;
+      sim.removeResident(removeId);
+      const snap = sim.snapshot(survivorId);
+      expect(snap.action?.defId).not.toBe('friend-nuzzle');
+      expect(snap.mode).toBe('idle');
+      expect(sim.getNeeds(survivorId).affection).toBeGreaterThanOrEqual(banked - 0.05);
+      // And life goes on for the survivor.
+      const decisions = snap.decisionCount;
+      for (let i = 0; i < 300; i++) sim.step(0.1);
+      expect(sim.snapshot(survivorId).decisionCount).toBeGreaterThan(decisions);
+    }
+  });
+
+  it('H1 still holds with nuzzles in the mix (and nuzzles do occur)', () => {
+    const run = () => {
+      const sim = new YardSim({
+        residents: [
+          mkRes('arr-1', 'cuddly', NEEDY, { startPos: { x: 46, y: 55 } }),
+          mkRes('arr-2', 'gentle', CONTENT, { startPos: { x: 54, y: 55 } }),
+          mkRes('arr-3', 'playful', NEEDS_60, { startPos: { x: 50, y: 78 } }),
+        ],
+      });
+      for (let i = 0; i < 18000; i++) sim.step(0.1);
+      return sim;
+    };
+    const a = run();
+    const b = run();
+    const nuzzles = a.events.filter(
+      (e) => e.type === 'actionStarted' && e.defId === 'friend-nuzzle',
+    ).length;
+    expect(nuzzles).toBeGreaterThan(0);
+    expect(fnv1a(JSON.stringify(a.events))).toBe(fnv1a(JSON.stringify(b.events)));
+    expect(a.snapshots()).toEqual(b.snapshots());
+  });
+
+  it('battery: nuzzles happen at a sane rate and Love stays in the cozy bands', () => {
+    const RNG_SEED = 987654;
+    const IDS = ['arr-1', 'arr-2', 'arr-3', 'arr-4'] as const;
+    const traits = ['playful', 'sleepy', 'foodie', 'shy'] as const;
+    const sim = new YardSim({
+      residents: traits.map((traitId, i) => {
+        const profile = deriveAiProfile(RNG_SEED, i + 1, traitId);
+        return {
+          instanceId: IDS[i],
+          traitId,
+          weights: profile.weights,
+          metabolism: profile.metabolism,
+          needs: { ...profile.arrivalNeeds },
+          rngSeed: RNG_SEED,
+          arrivalIndex: i + 1,
+        };
+      }),
+    });
+    const below25 = new Map<string, number>();
+    const at100 = new Map<string, number>();
+    const samples = new Map<string, number>();
+    for (const id of IDS) {
+      below25.set(id, 0);
+      at100.set(id, 0);
+      samples.set(id, 0);
+    }
+    for (let i = 0; i < 10800; i++) {
+      sim.step(0.1); // 3 compressed sim-days
+      if (i % 10 === 0) {
+        for (const snap of sim.snapshots()) {
+          samples.set(snap.instanceId, samples.get(snap.instanceId)! + 1);
+          if (snap.needs.affection < 25) {
+            below25.set(snap.instanceId, below25.get(snap.instanceId)! + 1);
+          }
+          if (snap.needs.affection >= 99.95) {
+            at100.set(snap.instanceId, at100.get(snap.instanceId)! + 1);
+          }
+        }
+      }
+    }
+    const nuzzleStarts = sim.events.filter(
+      (e) => e.type === 'actionStarted' && e.defId === 'friend-nuzzle',
+    ).length;
+    // §6.2's cozy contract for Love, with the social source live: nobody
+    // starves below 25 for long, and nobody sits pinned at 100 either.
+    for (const id of IDS) {
+      const n = samples.get(id)!;
+      expect(below25.get(id)! / n, `${id} below-25 share`).toBeLessThanOrEqual(0.08);
+      expect(at100.get(id)! / n, `${id} at-100 share`).toBeLessThan(0.95);
+    }
+    expect(nuzzleStarts).toBeGreaterThanOrEqual(3);
+    // The measured rate (nuzzles per resident-day) is reported with the
+    // build; the assertion is the sanity floor, not the tuning target.
+    expect(nuzzleStarts / (IDS.length * 3)).toBeGreaterThan(0);
   });
 });

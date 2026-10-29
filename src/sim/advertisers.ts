@@ -6,8 +6,10 @@ import type { NeedId } from './needs';
 //
 // STEP 2 (part A): the FULL §5.1 catalogue is here — every object def with
 // its table gains/duration/capacity, plus the wander & sniff fallback.
-// Friend nuzzle (§5.1's dynamic resident advertiser) is still NOT here: it
-// needs two residents, which is a later step.
+// STEP 2C adds the last §5.1 row: friend nuzzle, the one DYNAMIC
+// advertiser (§5.2) — it has no yard placement; each resident's brain
+// generates one instance per eligible partner at score time, anchored at
+// the partner's live position (see nuzzleInstance below).
 
 export type Category =
   | 'eat'
@@ -94,6 +96,15 @@ export const ADVERTISERS: Record<string, AdvertiserDef> = {
     id: 'cuddle-rug', category: 'cuddle', source: 'object',
     gains: { affection: 35, energy: 12 }, durationSec: 14, capacity: 3,
   },
+  // --- social (§5.1): the dynamic advertiser. One instance is generated
+  // per eligible partner at score time (§5.2); capacity 1 PAIR — the
+  // instance key names the partner (nuzzleInstanceKey), so a reservation
+  // by one initiator makes the same partner ineligible for everyone else.
+  // The partner receives HALF these gains (nuzzlePartnerGains below).
+  'friend-nuzzle': {
+    id: 'friend-nuzzle', category: 'social', source: 'resident',
+    gains: { affection: 25, fun: 16 }, durationSec: 8, capacity: 1,
+  },
   // --- the fallback (§5.1): always eligible, exempt from congestion ---
   wander: {
     id: 'wander', category: 'explore', source: 'fallback',
@@ -159,6 +170,47 @@ export const WANDER_INSTANCE: AdvertiserInstance = {
 
 /** The resident's home/idle spot, centre yard. */
 export const HOME_SPOT = { x: 50, y: 55 };
+
+// --- Friend nuzzle (§5.1/§5.2): the generated instances ----------------
+
+/** Instance keys for nuzzle candidates name the TARGET partner, so two
+ * initiators courting the same resident produce the same key and the
+ * capacity-1 gate + reservation machinery serialize them. */
+export const NUZZLE_KEY_PREFIX = 'nuzzle-with:';
+
+export function nuzzleInstanceKey(partnerId: string): string {
+  return `${NUZZLE_KEY_PREFIX}${partnerId}`;
+}
+
+export function nuzzlePartnerIdOf(instanceKey: string): string | null {
+  return instanceKey.startsWith(NUZZLE_KEY_PREFIX)
+    ? instanceKey.slice(NUZZLE_KEY_PREFIX.length)
+    : null;
+}
+
+/** One nuzzle candidate, anchored at the partner's live position. */
+export function nuzzleInstance(
+  partnerId: string,
+  x: number,
+  y: number,
+): AdvertiserInstance {
+  return {
+    key: nuzzleInstanceKey(partnerId),
+    def: ADVERTISERS['friend-nuzzle'],
+    x,
+    y,
+  };
+}
+
+/** The partner's share (§1.4/§5.1: "partner gains half"), derived from
+ * the def so the two can never drift apart: Love +12.5, Fun +8. */
+export function nuzzlePartnerGains(): Partial<Record<NeedId, number>> {
+  const out: Partial<Record<NeedId, number>> = {};
+  for (const [n, g] of Object.entries(ADVERTISERS['friend-nuzzle'].gains)) {
+    out[n as NeedId] = (g as number) / 2;
+  }
+  return out;
+}
 
 /** Yard diagonal for the distance factor (§3.1): the yard is 100×100. */
 export const YARD_DIAGONAL = Math.hypot(100, 100);

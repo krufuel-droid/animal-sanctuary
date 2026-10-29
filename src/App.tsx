@@ -175,6 +175,7 @@ function simViewChanged(a: SimSnapshot | null, b: SimSnapshot): boolean {
   if (a.instanceId !== b.instanceId || a.mode !== b.mode) return true;
   if ((a.action?.defId ?? '') !== (b.action?.defId ?? '')) return true;
   if ((a.action?.phase ?? '') !== (b.action?.phase ?? '')) return true;
+  if ((a.action?.partnerId ?? '') !== (b.action?.partnerId ?? '')) return true;
   if (a.thought !== b.thought) return true;
   if (Math.abs(a.x - b.x) > 0.5 || Math.abs(a.y - b.y) > 0.5) return true;
   const grain = DEBUG ? 0.05 : 0.5;
@@ -487,6 +488,31 @@ export default function App() {
     }, ARRIVAL_PAUSE_MS);
     return () => window.clearTimeout(t);
   }, [game, view.kind, arriveNext]);
+
+  /* friend nuzzle flourish (step 2C): when a pair starts nuzzling, float
+     a heart over the pair once — the rig's existing flourish vocabulary
+     (the same floatEmojis the care reactions use). Both walkers also
+     wear a 💗 chip while the nuzzle runs (in the yard render below). */
+  const nuzzlePairsSeen = useRef(new Set<string>());
+  useEffect(() => {
+    const current = new Set<string>();
+    for (const s of Object.values(simViews)) {
+      if (
+        s.action?.defId === 'friend-nuzzle' &&
+        s.action.phase === 'acting' &&
+        s.action.partnerId
+      ) {
+        current.add([s.instanceId, s.action.partnerId].sort().join('+'));
+      }
+    }
+    for (const key of current) {
+      if (!nuzzlePairsSeen.current.has(key)) {
+        const [first] = key.split('+');
+        stageRefs.current.get(first)?.floatEmojis(['💗']);
+      }
+    }
+    nuzzlePairsSeen.current = current;
+  }, [simViews]);
 
   /* debug handle for the §8 D-check probes */
   useEffect(() => {
@@ -1008,6 +1034,16 @@ export default function App() {
                         {NEED_ICONS[snap.thought]}
                       </div>
                     )}
+                    {snap?.action?.defId === 'friend-nuzzle' &&
+                      snap.action.phase === 'acting' && (
+                        <div
+                          className="absolute -top-2 left-0 z-20 rounded-full bg-white border border-rose-200 shadow px-2 py-1 text-lg animate-pop-in"
+                          data-nuzzle={snap.action.partnerId ?? ''}
+                          aria-hidden
+                        >
+                          💗
+                        </div>
+                      )}
                     {isSel && (
                       <div className="absolute left-1/2 -translate-x-1/2 -bottom-2 z-20 rounded-full bg-amber-400 text-amber-950 text-xs font-extrabold px-2.5 py-0.5 shadow whitespace-nowrap pointer-events-none">
                         {r.name}
