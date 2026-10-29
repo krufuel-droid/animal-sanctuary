@@ -192,8 +192,14 @@ export const AnimalStage = forwardRef<
     initialLine?: string | null;
     /** Phase 2: the yard sim's sleep pose, when it is driving this stage. */
     sleepOverride?: SleepState | null;
+    /** Yard placement: flip the speech bubble under the animal when it is
+     *  near the yard's top edge (an above-bubble would clip off-screen),
+     *  and anchor it to a side when the animal hugs a yard edge, so the
+     *  words never cover the animal or spill out of the yard. */
+    bubbleBelow?: boolean;
+    bubbleAnchor?: 'center' | 'left' | 'right';
   }
->(function AnimalStage({ species, outfit, instanceId, traitId, idle, initialLine, sleepOverride }, ref) {
+>(function AnimalStage({ species, outfit, instanceId, traitId, idle, initialLine, sleepOverride, bubbleBelow, bubbleAnchor }, ref) {
   const svgRef = useRef<HTMLDivElement | null>(null);
   const idleCtl = useIdle(svgRef, {
     species,
@@ -269,11 +275,29 @@ export const AnimalStage = forwardRef<
       {bubble && (
         <div
           ref={bubbleRef}
-          className="absolute left-1/2 -translate-x-1/2 -top-3 z-20 max-w-[92%] rounded-2xl bg-white border border-amber-200 shadow px-3.5 py-2 text-[15px] font-medium text-center"
+          className={`absolute z-20 w-max max-w-[150%] pointer-events-none rounded-2xl bg-white border border-amber-200 shadow px-3.5 py-2 text-[15px] font-medium text-center ${
+            bubbleBelow ? 'top-[calc(100%-2px)]' : 'bottom-[calc(100%-2px)]'
+          } ${
+            bubbleAnchor === 'left'
+              ? 'left-0'
+              : bubbleAnchor === 'right'
+                ? 'right-0'
+                : 'left-1/2 -translate-x-1/2'
+          }`}
           role="status"
         >
           {bubble.text}
-          <span className="absolute left-1/2 -translate-x-1/2 -bottom-[7px] w-3.5 h-3.5 bg-white border-b border-r border-amber-200 rotate-45" />
+          <span
+            className={`absolute w-3.5 h-3.5 bg-white border-amber-200 rotate-45 ${
+              bubbleBelow ? '-top-[7px] border-t border-l' : '-bottom-[7px] border-b border-r'
+            } ${
+              bubbleAnchor === 'left'
+                ? 'left-[30%]'
+                : bubbleAnchor === 'right'
+                  ? 'left-[70%]'
+                  : 'left-1/2 -translate-x-1/2'
+            }`}
+          />
         </div>
       )}
       <div ref={bounceRef}>

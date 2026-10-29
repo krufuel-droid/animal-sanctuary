@@ -966,7 +966,7 @@ export default function App() {
 
       {view.kind === 'sanctuary' && (
         <>
-          <section className="relative rounded-3xl bg-gradient-to-b from-sky-200 via-green-100 to-green-200 border border-green-200 shadow-sm px-4 pt-10 pb-4 overflow-hidden">
+          <section className="relative rounded-3xl bg-gradient-to-b from-sky-200 via-green-100 to-green-200 border border-green-200 shadow-sm px-4 pt-16 pb-4 overflow-hidden">
             {/* Phase 2 yard: advertiser props at their sim anchors, and
                 EVERY resident walking between them (each walker is an HTML
                 wrapper — the rig's transforms are never touched). Tap a
@@ -990,6 +990,15 @@ export default function App() {
               {game.residents.map((r, idx) => {
                 const snap = simViews[r.instanceId];
                 const isSel = r.instanceId === selected.instanceId;
+                // Speech-bubble placement: above the animal normally, but
+                // flipped underneath in the yard's top band (wander can
+                // reach y=14, where an above-bubble clips off the top),
+                // and side-anchored near the left/right edges so a wide
+                // bubble never spills out of the yard.
+                const bubbleBelow = (snap?.y ?? 55) < 32;
+                const snapX = snap?.x ?? 50;
+                const bubbleAnchor =
+                  snapX < 22 ? 'left' : snapX > 78 ? 'right' : 'center';
                 const trait =
                   r.traitId && r.traitId in TRAITS ? TRAITS[r.traitId as TraitId] : null;
                 return (
@@ -1024,6 +1033,8 @@ export default function App() {
                       idle
                       initialLine={trait ? trait.kidLine : null}
                       sleepOverride={sleepOf(snap)}
+                      bubbleBelow={bubbleBelow}
+                      bubbleAnchor={bubbleAnchor}
                     />
                     {snap?.thought && (
                       <div
@@ -1045,7 +1056,9 @@ export default function App() {
                         </div>
                       )}
                     {isSel && (
-                      <div className="absolute left-1/2 -translate-x-1/2 -bottom-2 z-20 rounded-full bg-amber-400 text-amber-950 text-xs font-extrabold px-2.5 py-0.5 shadow whitespace-nowrap pointer-events-none">
+                      <div
+                        className={`absolute left-1/2 -translate-x-1/2 ${bubbleBelow ? '-top-9' : '-bottom-2'} z-20 rounded-full bg-amber-400 text-amber-950 text-xs font-extrabold px-2.5 py-0.5 shadow whitespace-nowrap pointer-events-none`}
+                      >
                         {r.name}
                       </div>
                     )}
