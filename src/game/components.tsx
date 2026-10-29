@@ -213,6 +213,7 @@ export const AnimalStage = forwardRef<
   );
   const [floats, setFloats] = useState<Floaty[]>([]);
   const bubbleTimer = useRef<number | undefined>(undefined);
+  const greetingTimer = useRef<number | undefined>(undefined);
   const bubbleSeq = useRef(0);
   const bubbleRef = useRef<HTMLDivElement | null>(null);
   const bounceRef = useRef<HTMLDivElement | null>(null);
@@ -235,9 +236,25 @@ export const AnimalStage = forwardRef<
     }
   }, [bubble]);
 
+  // The trait line is a GREETING, not a permanent sign: it shows when the
+  // animal arrives, then fades. In the multi-resident yard, four standing
+  // trait bubbles at once walled the animals in words (Amanda, Oct 29:
+  // "The words are covering the animals"). After the greeting, bubbles
+  // appear only when the animal actually says something, via say().
+  useEffect(() => {
+    if (!initialLine) return;
+    greetingTimer.current = window.setTimeout(() => {
+      setBubble((b) => (b && b.key === 0 ? null : b));
+    }, 4500);
+    return () => window.clearTimeout(greetingTimer.current);
+    // Mount-only: the greeting belongs to this animal's arrival.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   useImperativeHandle(ref, () => ({
     say: (line: string) => {
       window.clearTimeout(bubbleTimer.current);
+      window.clearTimeout(greetingTimer.current);
       bubbleSeq.current += 1;
       setBubble({ text: line, key: bubbleSeq.current });
       bubbleTimer.current = window.setTimeout(() => setBubble(null), 3600);
